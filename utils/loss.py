@@ -348,11 +348,14 @@ class ComputeLoss:
     
     #     return lpixl, larea, ldist
     
-    # EDL 기반 Segmentation Loss
+    # EDL 기반 Segmentation Loss (vacuity 기반 탐지를 위한 Dirichlet loss)
     def compute_loss_seg(self, p, masks, targets, weight=None):
         """
         p: [B,2,H,W]  (bg,obj evidence logits)
         masks: [B,1,H,W] (0/1 binary GT mask)
+
+        학습 목표: 배경은 evidence를 높여 vacuity↓, 객체도 evidence를 높여 vacuity↓
+        → 학습이 부족한 영역(작은 객체 등)은 자연스럽게 vacuity↑ → 추론 시 탐지 후보
         """
         device = targets.device
         bs, nc_t, ny, nx = masks.shape
@@ -360,30 +363,45 @@ class ComputeLoss:
         assert p.shape[1] == 2, f"EDL 사용 시 pred channels must be 2, got {p.shape}"
 
         # evidence / alpha
-        evidence = F.softplus(p)          # [B,2,H,W]
-        alpha = evidence + 1.0
+        evidence = F.softplus(p)          # [B,2,H,W] >= 0
+        alpha = evidence + 1.0            # Dirichlet params
         S = alpha.sum(dim=1, keepdim=True)  # [B,1,H,W]
-        probs = alpha / S                  # expected prob
 
-        y = masks
-        y2 = torch.cat([1.0 - y, y], dim=1)  # [B,2,H,W]
+        # one-hot GT
+        y = masks                         # [B,1,H,W]
+        one_hot = torch.cat([1.0 - y, y], dim=1)  # [B,2,H,W]
 
-        # expected CE
-        ce = -(y2 * (probs.clamp_min(1e-8)).log()).sum(dim=1, keepdim=True)  # [B,1,H,W]
-        lpixl = ce.mean()  # <-- 0-dim 이 됨
+        # 1) EDL MSE loss (Type-II Maximum Likelihood)
+        probs = alpha / S
+        err = (one_hot - probs) ** 2
+        var = alpha * (S - alpha) / (S ** 2 * (S + 1))
+        edl_mse = (err + var).sum(dim=1)  # [B,H,W]
 
-        # evidence regularizer (과확신 억제 + 붕괴 방지)
-        e_bg = evidence[:, 0:1]
-        e_obj = evidence[:, 1:2]
-        reg = (y * e_bg + (1.0 - y) * e_obj).mean()
-        lpixl = lpixl + 0.01 * reg
+        # 2) KL divergence: 틀린 클래스의 evidence를 0으로 보냄
+        #    → 근거 없이 아는 척(overconfident) 방지 → vacuity가 의미있게 학습됨
+        alpha_tilde = one_hot + (1.0 - one_hot) * alpha
+        kl = self._kl_divergence_dirichlet(alpha_tilde)  # [B,H,W]
 
-        # ===== 핵심: cat에 들어가도록 (1,) shape로 강제 =====
-        lpixl = lpixl.reshape(1)
+        annealing_coef = min(1.0, getattr(ComputeLoss, '_edl_epoch', 1) / 10.0)
+        edl_loss = edl_mse + annealing_coef * kl
 
+        if weight is not None:
+            edl_loss = edl_loss * weight.squeeze(1)
+
+        lpixl = edl_loss.mean().reshape(1)
         larea = torch.zeros(1, device=device)
         ldist = torch.zeros(1, device=device)
         return lpixl, larea, ldist
+
+    @staticmethod
+    def _kl_divergence_dirichlet(alpha):
+        """KL(Dir(alpha) || Dir(1,...,1)) per pixel. alpha: [B, K, H, W]"""
+        K = alpha.shape[1]
+        S = alpha.sum(dim=1)  # [B, H, W]
+        kl = torch.lgamma(S) - torch.lgamma(torch.tensor(float(K), device=alpha.device)) \
+             - torch.lgamma(alpha).sum(dim=1) \
+             + ((alpha - 1.0) * (torch.digamma(alpha) - torch.digamma(S.unsqueeze(1)))).sum(dim=1)
+        return kl
 
     @staticmethod
     def dice_loss(inputs, targets):

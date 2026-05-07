@@ -35,7 +35,7 @@ backbone:
   # [-1, 1, ASPP, [256, [1, 2, 4, 6]]],
   #  [[-1], 1, Segmenter, [1]],
    [[-1], 1, Segmenter, [2]], # [1] -> [2]
-   [[4, -1], 1, HeatMapParser, [256, 8, 0.5]],  # 7
+   [[4, -1], 1, HeatMapParser, [256, 8, 0.15]],  # 7, vacuity threshold (EDL)
 
    [-1, 1, Conv, [512, 3, 2]],  # 8-P4/16
    [-1, 9, C3, [512]],

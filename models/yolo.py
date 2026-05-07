@@ -69,7 +69,13 @@ class Detect(nn.Module):
     @torch.no_grad()
     def get_indices(self, offsets, mask, thresh=0.3):
         device, dtype = mask.device, mask.dtype
-        if torch.max(mask) > 1. or torch.min(mask) < 0.:
+        if mask.dim() == 4 and mask.shape[1] == 2:
+            # EDL: 2-channel evidence logits → vacuity map
+            evidence = F.softplus(mask.detach())
+            alpha = evidence + 1.0
+            S = alpha.sum(dim=1, keepdim=True)
+            mask = 2.0 / S  # vacuity [B,1,H,W]
+        elif torch.max(mask) > 1. or torch.min(mask) < 0.:
             mask = mask.detach().sigmoid()
 
         patch_w, patch_h = offsets[0, 3:5] - offsets[0, 1:3]
@@ -474,7 +480,15 @@ class Model(nn.Module):
                         return (None, None), pred_masks
                 else:
                     x, thresh = x
-                    heatmap = pred_masks[0].detach().sigmoid()
+                    _pm = pred_masks[0].detach()
+                    if _pm.shape[1] == 2:
+                        # EDL: vacuity map으로 객체 영역 판단
+                        _ev = F.softplus(_pm)
+                        _alpha = _ev + 1.0
+                        _S = _alpha.sum(dim=1, keepdim=True)
+                        heatmap = 2.0 / _S  # vacuity [B,1,H,W]
+                    else:
+                        heatmap = _pm.sigmoid()
                     heatmap = heatmap > thresh
             y.append(x if m.i in self.save else None)  # save output
 

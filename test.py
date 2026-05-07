@@ -17,7 +17,9 @@ from utils.datasets import create_dataloader, norm_imgs
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr, \
     target2mask, check_mask
-from utils.metrics import ap_per_class, ConfusionMatrix, cluster_recall, sparse_recall, mask_pr, hm_verbose
+from utils.metrics import ap_per_class, ConfusionMatrix, cluster_recall, sparse_recall, mask_pr, hm_verbose, \
+    heatmap_quality_update, heatmap_quality_summary, \
+    patch_quality_update, patch_quality_summary
 from utils.plots import plot_images, output_to_target, plot_study_txt, LatencyBucket
 from utils.torch_utils import select_device, time_synchronized, model_info
 from utils.loss import ComputeLoss
@@ -119,6 +121,96 @@ def test(data,
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     sp_r, m_p, m_r, attr = [], [], [], []
     gflops, infer_times = [], []
+    hm_stats    = dict(tp=0, fp=0, tn=0, fn=0, obj_hit=0, obj_total=0)
+    patch_stats = dict(obj_recalled=0, obj_total=0, gt_coverage_sum=0.0,
+                       bg_patches=0, total_patches=0)
+
+    # ── EDL routing 통계 monkey-patch ────────────────────────────────────────
+    _routing_stats = dict(n_images=0, n_edl_active=0, n_cap_only=0, n_no_cap=0,
+                          sure_total=0, explore_total=0,
+                          clusters_before=0, clusters_after=0)
+    _hmp = None
+    for _mod in model.modules():
+        if type(_mod).__name__ == 'HeatMapParser':
+            _hmp = _mod
+            break
+    if _hmp is not None:
+        import types as _types
+        _rs = _routing_stats
+
+        def _patched_forward(self, x):
+            x_feat, heatmaps = x
+            bs, c, ny, nx = x_feat.shape
+            device_ = x_feat.device
+            if len(heatmaps) >= 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 1:
+                mask_raw = torch.cat([heatmaps[0], heatmaps[1]], dim=1).detach()
+            else:
+                mask_raw = heatmaps[0].detach()
+            vacuity = None
+            if mask_raw.shape[1] == 1:
+                mask_pred = mask_raw[:, 0]
+                if torch.max(mask_pred) > 1.0 or torch.min(mask_pred) < 0.0:
+                    mask_pred = mask_pred.sigmoid()
+            else:
+                ev = F.softplus(mask_raw)
+                al = ev + 1.0
+                S  = al.sum(dim=1)
+                mask_pred = (al[:, 1] / S).detach()
+                vacuity   = (2.0 / S).detach()
+            if self.training:
+                return self.uni_slicer(x_feat, mask_pred, self.ratio, self.threshold, device=device_)
+            total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold)
+            Kcap = int(self.max_patches or 0)
+            rho  = float(self.explore_ratio or 0.0)
+            lam  = float(self.explore_lambda or 0.0)
+            _rs['n_images'] += bs
+            patches, offsets = [], []
+            for bi, clusters in enumerate(total_clusters):
+                if clusters.numel() == 0:
+                    _rs['n_no_cap'] += 1
+                    continue
+                _rs['clusters_before'] += clusters.shape[0]
+                if Kcap > 0 and clusters.shape[0] > Kcap:
+                    x1c, y1c, x2c, y2c = clusters[:,0], clusters[:,1], clusters[:,2], clusters[:,3]
+                    cx = ((x1c + x2c) // 2).clamp_(0, nx - 1)
+                    cy = ((y1c + y2c) // 2).clamp_(0, ny - 1)
+                    p_ = mask_pred[bi, cy, cx]
+                    if vacuity is not None:
+                        v  = vacuity[bi, cy, cx]
+                        sure_score = p_ * (1.0 - v)
+                        exp_score  = p_ + lam * v
+                        K1 = max(0, min(int(round(Kcap * rho)), Kcap))
+                        K0 = Kcap - K1
+                        k0 = min(K0, clusters.shape[0])
+                        top0 = torch.topk(sure_score, k=k0, largest=True).indices
+                        if K1 > 0 and clusters.shape[0] > k0:
+                            exp2 = exp_score.clone(); exp2[top0] = -1e9
+                            k1 = min(K1, clusters.shape[0] - k0)
+                            top1 = torch.topk(exp2, k=k1, largest=True).indices
+                            keep = torch.cat([top0, top1], dim=0)
+                        else:
+                            keep = top0; k1 = 0
+                        clusters = clusters[keep]
+                        _rs['n_edl_active']    += 1
+                        _rs['sure_total']      += k0
+                        _rs['explore_total']   += (k1 if K1 > 0 and clusters.shape[0] > k0 else 0)
+                    else:
+                        keep = torch.topk(p_, k=Kcap, largest=True).indices
+                        clusters = clusters[keep]
+                        _rs['n_cap_only'] += 1
+                else:
+                    _rs['n_no_cap'] += 1
+                _rs['clusters_after'] += clusters.shape[0]
+                for _x1, _y1, _x2, _y2 in clusters:
+                    patches.append(x_feat[bi, :, _y1:_y2, _x1:_x2])
+                    offsets.append(torch.tensor([bi, _x1, _y1, _x2, _y2], device=device_))
+            if len(patches):
+                return torch.stack(patches), torch.stack(offsets)
+            return torch.zeros((0, c, ny, nx), device=device_), torch.zeros((0, 5), device=device_)
+
+        _hmp._orig_forward = _hmp.forward
+        _hmp.forward = _types.MethodType(_patched_forward, _hmp)
+    # ─────────────────────────────────────────────────────────────────────────
     for batch_i, (img, targets, masks, m_weights, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
     # for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
@@ -153,9 +245,20 @@ def test(data,
         t0 += infer_times[-1]
         train_out = (p_det, p_seg)
         if hm_metric:
-            mask_pr(masks, p_seg[0], targets, m_p, m_r)
-            sparse_recall(p_seg[0], targets, sp_r)
+            # EDL (C=2) → 1채널 logit으로 변환 (mask_pr/sparse_recall은 sigmoid 후 threshold)
+            hm_raw = p_seg[0]
+            if hm_raw.shape[1] == 2:
+                import torch.nn.functional as _F
+                _ev = _F.softplus(hm_raw)
+                _al = _ev + 1.0
+                _p  = (_al[:, 1:2] / _al.sum(dim=1, keepdim=True)).clamp(1e-6, 1 - 1e-6)
+                hm_1ch = torch.log(_p / (1.0 - _p))  # logit: sigmoid(hm_1ch) == p_obj
+            else:
+                hm_1ch = hm_raw
+            mask_pr(masks, hm_1ch, targets, m_p, m_r)
+            sparse_recall(hm_1ch, targets, sp_r)
             attr.append(targets[:, [1,4,5]])  # class, width, height
+            heatmap_quality_update(p_seg[0], masks, targets, hm_stats)
 
         # Compute loss
         if compute_loss:
@@ -169,6 +272,7 @@ def test(data,
             clusters = p_det[1][0] if p_det is not None else torch.zeros((0, 5), device=device)
             clusters = [clusters[clusters[:, 0] == bi, 1:] for bi in range(nb)]
             statistic_items += cluster_recall(clusters, targets, imgsz=(width, height), mode='bbox')
+            patch_quality_update(clusters, targets, patch_stats)
             if not training and opt.task == 'measure':
                 lbucket.add(len(clusters[0]), gflops[-1], infer_times[-1])
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
@@ -292,22 +396,47 @@ def test(data,
         mp, mr, bpr = m_p.mean().item(), m_r.mean().item(), sp_r.mean().item()
         print('\n'.join([str(res) for res in hm_verbose(sp_r, torch.cat(attr))]))
 
+        hq = heatmap_quality_summary(hm_stats)
+        print('\n[Heatmap Quality]')
+        print('  %-20s %.4f' % ('Pixel Precision',  hq['pixel_precision']))
+        print('  %-20s %.4f' % ('Pixel Recall',     hq['pixel_recall']))
+        print('  %-20s %.4f' % ('Pixel F1',         hq['pixel_f1']))
+        print('  %-20s %.4f' % ('Pixel IoU',        hq['pixel_iou']))
+        print('  %-20s %.4f' % ('Object Recall',    hq['obj_recall']))
+        print('  %-20s %.4f' % ('Background FPR',   hq['bg_fpr']))
+
+    if patch_stats['total_patches'] > 0:
+        pq = patch_quality_summary(patch_stats)
+        avg_patches = patch_stats['total_patches'] / max(seen, 1)
+        avg_bg = patch_stats['bg_patches'] / max(seen, 1)
+        avg_fg = avg_patches - avg_bg
+        print('\n[Patch Quality]')
+        print('  %-20s %.4f' % ('Patch Recall',     pq['patch_recall']))
+        print('  %-20s %.4f' % ('GT Coverage',      pq['gt_coverage']))
+        print('  %-20s %.4f' % ('BG Patch Ratio',   pq['bg_patch_ratio']))
+        print('  %-20s %.1f' % ('Avg Patches/Image', avg_patches))
+        print('  %-20s %.1f (FG) + %.1f (BG)' % ('  Breakdown', avg_fg, avg_bg))
+
 
     # Print results
     pf = '%20s' + '%11i' * 2 + '%11.3g' * 6  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, map, bpr, occupy))
 
     # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats) and False:
+    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i], bpr, occupy))
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
     if not training:
+        fps_infer = 1000. / t[0] if t[0] > 0 else 0
+        fps_total = 1000. / t[2] if t[2] > 0 else 0
         if opt.task == 'measure':
-            print('GFLOPs: %.1f. FPS: %.1f ' % (np.mean(gflops), 1000. / t[0]), end='')
+            print('GFLOPs: %.1f. ' % np.mean(gflops), end='')
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+        print('FPS (inference only): %.1f' % fps_infer)
+        print('FPS (total):          %.1f' % fps_total)
 
     # Plots
     if plots:
@@ -349,6 +478,11 @@ def test(data,
             # map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
         except Exception as e:
             print(f'pycocotools unable to run: \n{e}')
+
+    # Restore monkey-patched forward to avoid pickle issues
+    if _hmp is not None and hasattr(_hmp, '_orig_forward'):
+        _hmp.forward = _hmp._orig_forward
+        del _hmp._orig_forward
 
     # Return results
     model.float()  # for training

@@ -122,8 +122,119 @@ def hm_verbose(recall, attr):
     for i in range(len(size_sep)-1):
         ind = (size_sep[i] < s) & (s <= size_sep[i+1])
         res_size.append(recall[ind].mean().item())
-    
+
     return res_cls, res_size
+
+
+def patch_quality_update(clusters, targets, stats, stride=8, ios_thresh=0.5):
+    """
+    Accumulate patch quality stats for one batch.
+
+    clusters  : list[Tensor[N,4]]  xyxy in feature-map coords (pixels/stride), one per image
+    targets   : Tensor[M,6]        [bi, cls, xc_px, yc_px, w_px, h_px] already scaled to pixels
+    stats     : dict with keys obj_recalled, obj_total, gt_coverage_sum, bg_patches, total_patches
+    """
+    for bi, cluster in enumerate(clusters):
+        t = targets[targets[:, 0] == bi][:, 2:]   # [M,4] xc,yc,w,h pixels
+        t_fm   = t / stride                         # feature-map space
+        t_xyxy = general.xywh2xyxy(t_fm)           # [M,4] xyxy feature-map
+
+        n_patches = cluster.shape[0]
+        n_gt      = len(t)
+        stats['total_patches'] += n_patches
+        stats['obj_total']     += n_gt
+
+        if n_patches == 0 or n_gt == 0:
+            stats['bg_patches'] += n_patches
+            continue
+
+        ios = general.box_ios(t_xyxy, cluster)      # [M, N]  inter/min(area_gt, area_patch)
+
+        # Patch Recall: fraction of GT objects covered by at least one patch
+        stats['obj_recalled']    += int((ios >= ios_thresh).any(dim=1).sum())
+
+        # GT Coverage: average best-patch IoS per GT object
+        stats['gt_coverage_sum'] += float(ios.max(dim=1).values.sum())
+
+        # Background patches: patches that don't cover any GT object
+        stats['bg_patches'] += int((~(ios >= ios_thresh).any(dim=0)).sum())
+
+
+def patch_quality_summary(stats):
+    """Compute final patch quality metrics from accumulated stats dict."""
+    patch_recall   = stats['obj_recalled']    / (stats['obj_total']     + 1e-9)
+    gt_coverage    = stats['gt_coverage_sum'] / (stats['obj_total']     + 1e-9)
+    bg_patch_ratio = stats['bg_patches']      / (stats['total_patches'] + 1e-9)
+    return {
+        'patch_recall':   patch_recall,
+        'gt_coverage':    gt_coverage,
+        'bg_patch_ratio': bg_patch_ratio,
+    }
+
+
+def heatmap_quality_update(p_seg, masks, targets, stats, threshold=0.5):
+    """
+    Accumulate heatmap quality stats for one batch.
+
+    p_seg  : [B, C, H, W]  C=1 (sigmoid logit) or C=2 (EDL evidence logits)
+    masks  : [B, 1, H, W]  binary GT mask (0/1 float)
+    targets: [N, 6]        [batch_idx, cls, xc, yc, w, h] normalized
+    stats  : dict with int keys 'tp','fp','tn','fn','obj_hit','obj_total'
+    """
+    device = p_seg.device
+    B, C, H, W = p_seg.shape
+
+    # → detection map [B,1,H,W]
+    if C == 2:
+        # EDL: vacuity 기반 탐지 (불확실한 곳 = 객체 후보)
+        evidence = F.softplus(p_seg)
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=1, keepdim=True)
+        detection_map = 2.0 / S           # vacuity [B,1,H,W]
+    else:
+        detection_map = p_seg.sigmoid()
+
+    pred_bin = detection_map >= threshold  # [B,1,H,W]
+    gt_bin   = masks >= 0.5               # [B,1,H,W]
+
+    stats['tp'] += int((pred_bin &  gt_bin).sum())
+    stats['fp'] += int((pred_bin & ~gt_bin).sum())
+    stats['tn'] += int((~pred_bin & ~gt_bin).sum())
+    stats['fn'] += int((~pred_bin &  gt_bin).sum())
+
+    # object recall: ≥1 positive pixel inside each GT box
+    if len(targets):
+        gain = torch.tensor([[W, H, W, H]], device=device, dtype=torch.float32)
+        bboxes = general.xywh2xyxy(targets[:, 2:6])   # normalized xyxy
+        bboxes = (bboxes * gain).long()
+        bboxes[:, [0, 2]] = bboxes[:, [0, 2]].clamp(0, W)
+        bboxes[:, [1, 3]] = bboxes[:, [1, 3]].clamp(0, H)
+        for i in range(len(targets)):
+            bi = int(targets[i, 0].long())
+            x1, y1, x2, y2 = bboxes[i].tolist()
+            x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)
+            hit = pred_bin[bi, 0, y1:y2, x1:x2].any()
+            stats['obj_hit']   += int(hit)
+            stats['obj_total'] += 1
+
+
+def heatmap_quality_summary(stats):
+    """Compute final metrics from accumulated stats dict."""
+    tp, fp, tn, fn = stats['tp'], stats['fp'], stats['tn'], stats['fn']
+    prec  = tp / (tp + fp + 1e-9)
+    rec   = tp / (tp + fn + 1e-9)
+    f1    = 2 * prec * rec / (prec + rec + 1e-9)
+    iou   = tp / (tp + fp + fn + 1e-9)
+    obj_r = stats['obj_hit'] / (stats['obj_total'] + 1e-9)
+    bg_fpr = fp / (fp + tn + 1e-9)
+    return {
+        'pixel_precision': prec,
+        'pixel_recall':    rec,
+        'pixel_f1':        f1,
+        'pixel_iou':       iou,
+        'obj_recall':      obj_r,
+        'bg_fpr':          bg_fpr,
+    }
 
 
 def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=()):

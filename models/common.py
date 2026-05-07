@@ -637,6 +637,7 @@ class MaskedTransformerBlock(nn.Module):
 
 #         return patches, self.grid_off
 
+
 class HeatMapParser(nn.Module):
     def __init__(
         self,
@@ -700,12 +701,13 @@ class HeatMapParser(nn.Module):
             mask_pred = mask_pred[:, 0, :, :].detach()  # [B,H,W]
 
         elif mask_raw.shape[1] == 2:
-            # evidential logits (bg,obj) -> p_obj + vacuity
+            # EDL: vacuity 맵으로 객체 탐지 (heatmap/prob 사용하지 않음)
             evidence = F.softplus(mask_raw)   # [B,2,H,W] >= 0
             alpha = evidence + 1.0
             S = alpha.sum(dim=1)              # [B,H,W]
-            mask_pred = (alpha[:, 1] / S).detach()   # p_obj
-            vacuity = (2.0 / S).detach()             # vacuity (K=2)
+            vacuity = (2.0 / S).detach()      # vacuity [B,H,W], 0~1
+            # vacuity가 높은 곳 = 불확실한 곳 = 객체 후보
+            mask_pred = vacuity               # prob 대신 vacuity를 사용
 
         else:
             raise ValueError(f"Unexpected heatmap channels after merge: {mask_raw.shape[1]}")
@@ -713,7 +715,7 @@ class HeatMapParser(nn.Module):
         # ---------------------------
         # DEBUG ONCE: 학습/추론 상관없이 첫 호출에서 heatmaps 구조를 확정 출력
         # ---------------------------
-        if self.debug_once and (not self._printed_once):
+        if getattr(self, 'debug_once', False) and (not getattr(self, '_printed_once', False)):
             self._printed_once = True
             shapes = [tuple(h.shape) for h in heatmaps]
             print(f"[HeatMapParser][ONCE] train={self.training} len(heatmaps)={len(heatmaps)} shapes={shapes}")
@@ -738,57 +740,17 @@ class HeatMapParser(nn.Module):
             return self.uni_slicer(x, mask_pred, self.ratio, self.threshold * 1. + 0., device=device)
 
         # ---------------------------
-        # 3) Inference: adaptive slicing + (optional) cap + mixed routing
+        # 3) Inference: adaptive slicing → patchify (no routing/cap)
         # ---------------------------
         total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold * 1.0 + 0.)
 
         if getattr(self, 'cluster_only', False):
             return self.get_offsets_by_clusters(total_clusters).to(device)
 
-        Kcap = int(self.max_patches or 0)
-        rho = float(self.explore_ratio or 0.0)
-        lam = float(self.explore_lambda or 0.0)
-
         patches, offsets = [], []
         for bi, clusters in enumerate(total_clusters):
             if clusters.numel() == 0:
                 continue
-
-            # Option B: cap only when too many
-            if Kcap > 0 and clusters.shape[0] > Kcap:
-                x1, y1, x2, y2 = clusters[:, 0], clusters[:, 1], clusters[:, 2], clusters[:, 3]
-                cx = ((x1 + x2) // 2).clamp_(0, nx - 1)
-                cy = ((y1 + y2) // 2).clamp_(0, ny - 1)
-
-                p = mask_pred[bi, cy, cx]  # [N]
-
-                if vacuity is not None:
-                    v = vacuity[bi, cy, cx]  # [N]
-                    sure_score = p * (1.0 - v)
-                    exp_score  = p + lam * v
-
-                    K1 = int(round(Kcap * rho))
-                    K1 = max(0, min(K1, Kcap))
-                    K0 = Kcap - K1
-
-                    k0 = min(K0, clusters.shape[0])
-                    top0 = torch.topk(sure_score, k=k0, largest=True).indices
-
-                    if K1 > 0 and clusters.shape[0] > k0:
-                        exp2 = exp_score.clone()
-                        exp2[top0] = -1e9
-                        k1 = min(K1, clusters.shape[0] - k0)
-                        top1 = torch.topk(exp2, k=k1, largest=True).indices
-                        keep = torch.cat([top0, top1], dim=0)
-                    else:
-                        keep = top0
-
-                    clusters = clusters[keep]
-                else:
-                    keep = torch.topk(p, k=Kcap, largest=True).indices
-                    clusters = clusters[keep]
-
-            # Patchify
             for x1, y1, x2, y2 in clusters:
                 patches.append(x[bi, :, y1:y2, x1:x2])
                 offsets.append(torch.tensor([bi, x1, y1, x2, y2], device=device))
@@ -2152,7 +2114,7 @@ class YOLOv6Head(YOLOXHead):
 #         # ---------------------------
 #         # DEBUG ONCE: 학습/추론 상관없이 첫 호출에서 heatmaps 구조를 확정 출력
 #         # ---------------------------
-#         if self.debug_once and (not self._printed_once):
+#         if getattr(self, 'debug_once', False) and (not getattr(self, '_printed_once', False)):
 #             self._printed_once = True
 #             shapes = [tuple(h.shape) for h in heatmaps]
 #             print(f"[HeatMapParser][ONCE] train={self.training} len(heatmaps)={len(heatmaps)} shapes={shapes}")

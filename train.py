@@ -409,6 +409,7 @@ def train(hyp, opt, device, tb_writer=None):
             with amp.autocast(enabled=cuda and half_precision):
                 targets = targets.to(device)
                 pred = model((imgs, [masks]) if (use_gt and warmup_flag) else imgs, hm_only=opt.hm_only)  # forward
+                ComputeLoss._edl_epoch = epoch  # EDL KL annealing용 epoch 전달
                 loss, loss_items = compute_loss(pred, targets, imgsz=imgs.shape, masks=masks, m_weights=m_weights)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
