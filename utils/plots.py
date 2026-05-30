@@ -73,8 +73,10 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     return filtfilt(b, a, data)  # forward-backward filter
 
 
-def plot_one_box(x, im, color=(128, 128, 128), label=None, line_thickness=3):
-    # Plots one bounding box on image 'im' using OpenCV
+def plot_one_box(x, im, color=(128, 128, 128), label=None, line_thickness=3,
+                 text_color=(225, 255, 255)):
+    # Plots one bounding box on image 'im' using OpenCV (원본 ESOD 스타일).
+    # 라벨: 박스 색으로 채워진 배경 + 흰 글씨.
     assert im.data.contiguous, 'Image not contiguous. Apply np.ascontiguousarray(im) to plot_on_box() input image.'
     tl = line_thickness or round(0.002 * (im.shape[0] + im.shape[1]) / 2) + 1  # line/font thickness
     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
@@ -84,7 +86,82 @@ def plot_one_box(x, im, color=(128, 128, 128), label=None, line_thickness=3):
         t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
         c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
         cv2.rectangle(im, c1, c2, color, -1, cv2.LINE_AA)  # filled
-        cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+        cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 3, text_color,
+                    thickness=tf, lineType=cv2.LINE_AA)
+
+
+# Track already-placed label rectangles per image (module-level cache, reset on first call per image)
+_label_rects_cache = {'image_id': None, 'rects': []}
+
+
+def reset_small_label_cache(image_id=None):
+    """Call once per image before drawing labels with plot_one_box_small."""
+    _label_rects_cache['image_id'] = image_id
+    _label_rects_cache['rects'] = []
+
+
+def _rect_overlap(a, b):
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def plot_one_box_small(x, im, color=(128, 128, 128), label=None,
+                       line_thickness=1, font_size=0.4, font_thickness=1,
+                       text_color=(255, 255, 255), outline_color=(0, 0, 0)):
+    """Small-object-friendly box visualization.
+
+    Differences vs plot_one_box:
+      - thin box line (default 1 px)
+      - small text WITH black outline (no filled background box) — readable on any background
+      - label placed at top of box; auto-flips below if too close to top edge
+      - tries 4 candidate positions to avoid collision with already-placed labels
+      - call reset_small_label_cache() once per image before drawing
+    """
+    assert im.data.contiguous, 'Image not contiguous.'
+    h, w = im.shape[:2]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(im, c1, c2, color, thickness=line_thickness, lineType=cv2.LINE_AA)
+    if not label:
+        return
+    (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                    font_size, font_thickness)
+    pad = 2
+    # candidate placements: (text_origin_x, text_origin_y, rect)
+    candidates = []
+    # 1) above-left (default)
+    tx, ty = c1[0], c1[1] - pad
+    candidates.append((tx, ty, (tx, ty - th - pad, tx + tw, ty + pad)))
+    # 2) below-left
+    tx, ty = c1[0], c2[1] + th + pad
+    candidates.append((tx, ty, (tx, ty - th - pad, tx + tw, ty + pad)))
+    # 3) above-right
+    tx, ty = max(0, c2[0] - tw), c1[1] - pad
+    candidates.append((tx, ty, (tx, ty - th - pad, tx + tw, ty + pad)))
+    # 4) below-right
+    tx, ty = max(0, c2[0] - tw), c2[1] + th + pad
+    candidates.append((tx, ty, (tx, ty - th - pad, tx + tw, ty + pad)))
+
+    chosen = None
+    placed = _label_rects_cache['rects']
+    for tx, ty, r in candidates:
+        # bounds check
+        if r[0] < 0 or r[1] < 0 or r[2] >= w or r[3] >= h:
+            continue
+        if any(_rect_overlap(r, p) for p in placed):
+            continue
+        chosen = (tx, ty, r)
+        break
+    if chosen is None:
+        # fall back to default top-left even if collides
+        tx, ty = c1[0], max(th + pad, c1[1] - pad)
+        chosen = (tx, ty, (tx, ty - th - pad, tx + tw, ty + pad))
+    tx, ty, r = chosen
+    placed.append(r)
+    # 박스 색 채움 배경 + 흰 글씨 (plot_one_box 와 동일 스타일).
+    bg_x1, bg_y1, bg_x2, bg_y2 = r
+    cv2.rectangle(im, (int(bg_x1), int(bg_y1)), (int(bg_x2), int(bg_y2)),
+                  color, -1, cv2.LINE_AA)  # filled
+    cv2.putText(im, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                font_size, text_color, font_thickness, lineType=cv2.LINE_AA)
 
 
 def plot_one_box_PIL(box, im, color=(128, 128, 128), label=None, line_thickness=None):

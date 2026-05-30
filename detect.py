@@ -16,7 +16,7 @@ from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages, norm_imgs
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path, save_one_box, target2mask
-from utils.plots import colors, plot_one_box
+from utils.plots import colors, plot_one_box, plot_one_box_small, reset_small_label_cache
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
 
@@ -89,17 +89,43 @@ def detect(opt):
                 mask_raw = heatmaps[0].detach()
 
             vacuity = None
-            if mask_raw.shape[1] == 1:
+            # Dual calibrated fusion: F=(1-w)·prob_h+w·p_e, w=σ(gate)·(1-u)
+            if (len(heatmaps) == 3 and heatmaps[0].shape[1] == 1
+                    and heatmaps[1].shape[1] == 2 and heatmaps[2].shape[1] == 1):
+                _heat = heatmaps[0].detach()
+                _edl  = heatmaps[1].detach()
+                _gate = heatmaps[2].detach()
+                prob = _heat[:, 0].sigmoid()
+                _ev = F.softplus(_edl); _al = _ev + 1.0
+                _S = _al.sum(dim=1)
+                _u  = 2.0 / _S                                  # vacuity
+                _pe = _al[:, 1] / _S                            # EDL 객체확률 (ch1=obj)
+                _g  = _gate[:, 0].sigmoid()
+                _w  = _g * (1.0 - _u)
+                mask_pred = (1.0 - _w) * prob + _w * _pe
+            elif len(heatmaps) == 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 2:
+                _heat = heatmaps[0].detach(); _edl = heatmaps[1].detach()
+                prob = _heat[:, 0].sigmoid()
+                evidence = F.softplus(_edl); alpha = evidence + 1.0
+                S = alpha.sum(dim=1)
+                vacuity = (2.0 / S).detach()
+                mask_pred = torch.max(prob, vacuity)
+            elif mask_raw.shape[1] == 1:
                 mask_pred = mask_raw[:, 0]
                 if torch.max(mask_pred) > 1.0 or torch.min(mask_pred) < 0.0:
                     mask_pred = mask_pred.sigmoid()
             else:
-                # EDL: vacuity 기반 객체 탐지
+                # Single 2ch EDL Segmenter (Seg-only): u-aware keep score = p_obj + γ·u
+                # 기존 mask_pred = vacuity 는 잘못 (불확실 영역만 보게 됨 → 객체 검출 안 됨).
+                # 표준 HeatMapParser (yolo.py:117 / common.py:771) 와 동일하게 B-1 공식 사용.
                 evidence = F.softplus(mask_raw)
                 alpha = evidence + 1.0
-                S = alpha.sum(dim=1)
+                S = alpha.sum(dim=1)                            # [B, H, W]
+                p_obj = (alpha[:, 1] / S).detach()              # belief obj (ch1)
                 vacuity = (2.0 / S).detach()
-                mask_pred = vacuity  # prob 대신 vacuity 사용
+                import os as _os_seg
+                _gamma_seg = float(_os_seg.environ.get('ESOD_VAC_GAMMA', '0.5'))
+                mask_pred = (p_obj + _gamma_seg * vacuity).detach()
 
             if self.training:
                 return self.uni_slicer(x_feat, mask_pred, self.ratio, self.threshold, device=device)
@@ -185,14 +211,34 @@ def detect(opt):
         # Inference
         t1 = time_synchronized()
         (pred, p_det), masks = model(img, augment=opt.augment)
-        _seg = masks[0].float()  # [B, C, H, W]
-        if _seg.shape[1] == 2:  # EDL: vacuity map 시각화 (불확실한 곳 = 객체 후보)
-            _ev = F.softplus(_seg)
-            _al = _ev + 1.0
+        # masks: tensor (single) or list [heat,edl] / [heat,edl,gate] (dual)
+        if (isinstance(masks, (list, tuple)) and len(masks) == 3 and
+            masks[0].shape[1] == 1 and masks[1].shape[1] == 2 and masks[2].shape[1] == 1):
+            # Dual calibrated fusion: F=(1-w)·prob_h+w·p_e, w=σ(gate)·(1-u)
+            _heat = masks[0].float(); _edl = masks[1].float(); _gate = masks[2].float()
+            prob = _heat.sigmoid()
+            _ev = F.softplus(_edl); _al = _ev + 1.0
             _S = _al.sum(dim=1, keepdim=True)
-            masks = 2.0 / _S  # vacuity [B,1,H,W]
+            _pe = _al[:, 1:2] / _S                       # EDL 객체확률 (ch1=obj)
+            _u  = 2.0 / _S                               # vacuity = 인식 불확실도
+            _g  = _gate.sigmoid()
+            _w  = _g * (1.0 - _u)                        # 신뢰가중: EDL 확신할 때만 위임
+            masks = (1.0 - _w) * prob + _w * _pe         # [0,1] calibrated
+        elif (isinstance(masks, (list, tuple)) and len(masks) == 2 and
+              masks[0].shape[1] == 1 and masks[1].shape[1] == 2):
+            # Dual + max
+            _heat = masks[0].float(); _edl = masks[1].float()
+            prob = _heat.sigmoid()
+            _ev = F.softplus(_edl); _al = _ev + 1.0
+            vac = 2.0 / _al.sum(dim=1, keepdim=True)
+            masks = torch.max(prob, vac)
         else:
-            masks = _seg.sigmoid()
+            _seg = masks[0].float()
+            if _seg.shape[1] == 2:
+                _ev = F.softplus(_seg); _al = _ev + 1.0
+                masks = 2.0 / _al.sum(dim=1, keepdim=True)
+            else:
+                masks = _seg.sigmoid()
         if opt.view_center:
             masks = ((masks == F.max_pool2d(masks, 3, stride=1, padding=1)) & (masks > 0.3)).float()
         clusters = p_det[1][0] if (p_det is not None and p_det[1] is not None) else torch.zeros((0, 5), device=img.device)
@@ -231,7 +277,7 @@ def detect(opt):
                 heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_RAINBOW)
                 heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
                 image_att = cv2.addWeighted(im0, 0.4, heatmap, 0.5, 0)
-                cv2.imwrite(f'{save_dir}/{image_name}_1_attn.jpg', image_att)
+                cv2.imwrite(f'{save_dir}/{image_name}_attn.jpg', image_att)
 
                 label_path = str(p).replace('images', 'labels').replace('.jpg', '.txt')
                 if osp.exists(label_path):
@@ -239,14 +285,33 @@ def detect(opt):
                         lines = f.read().splitlines()
                     gt_bboxes = [list(map(float, line.split())) for line in lines]
 
+                    # OWOD: unknown class GT 는 magenta + "unknown" 으로 표시 (pred 와 일관)
+                    _unk_set = set()
+                    if getattr(opt, 'owod_vis', False) and getattr(opt, 'owod_unknown', ''):
+                        _unk_set = set(int(x) for x in opt.owod_unknown.split(',') if x.strip())
                     im1 = im0.copy()
+                    if getattr(opt, 'small_vis', False):
+                        reset_small_label_cache(image_name + '_gt')
                     for ci, xc, yc, w, h in gt_bboxes:
                         c = int(ci)
-                        label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]}')
                         xyxy = [(xc - w / 2.) * im0.shape[1], (yc - h / 2.) * im0.shape[0],
                                 (xc + w / 2.) * im0.shape[1], (yc + h / 2.) * im0.shape[0]]
-                        plot_one_box(xyxy, im1, label=label, color=colors(c, True), line_thickness=opt.line_thickness)
-                    cv2.imwrite(f'{save_dir}/{image_name}_5_gt.jpg', im1)
+                        if c in _unk_set:
+                            label = None if opt.hide_labels else 'unknown'
+                            col = (255, 0, 255)
+                        else:
+                            label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]}')
+                            col = colors(c, True)
+                        if getattr(opt, 'small_vis', False):
+                            plot_one_box_small(xyxy, im1, label=label, color=col,
+                                               line_thickness=opt.line_thickness,
+                                               font_size=opt.small_font_size,
+                                               font_thickness=opt.small_font_thickness,
+                                               text_color=(255, 255, 255))
+                        else:
+                            plot_one_box(xyxy, im1, label=label, color=col,
+                                         line_thickness=opt.line_thickness)
+                    cv2.imwrite(f'{save_dir}/{image_name}_gt.jpg', im1)
 
                     gt_mask_path = str(p).replace('/images/', '/masks/').replace('_masked.', '.').replace('.jpg', '.npy')
                     if os.path.exists(gt_mask_path):
@@ -257,7 +322,7 @@ def detect(opt):
                         heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_RAINBOW)
                         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
                         image_att = cv2.addWeighted(im0, 0.4, heatmap, 0.5, 0)
-                        cv2.imwrite(f'{save_dir}/{image_name}_2_attn_gt.jpg', image_att)
+                        cv2.imwrite(f'{save_dir}/{image_name}_attn_gt.jpg', image_att)
 
                 cluster = clusters[clusters[:, 0] == i, 1:] * 8
                 cluster = scale_coords(img.shape[2:], cluster, im0.shape).round()
@@ -265,16 +330,28 @@ def detect(opt):
                 for ci, xyxy in enumerate(cluster):
                     x1, y1, x2, y2 = list(map(int, xyxy))
                     plot_one_box((x1, y1, x2, y2), im2, color=(0, 255, 0), line_thickness=opt.line_thickness * 2)
-                cv2.imwrite(f'{save_dir}/{image_name}_3_cluster.jpg', im2)
+                cv2.imwrite(f'{save_dir}/{image_name}_cluster.jpg', im2)
 
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                if getattr(opt, 'small_vis', False):
+                    reset_small_label_cache(getattr(p, 'stem', str(p)) + '_pred')
 
-                # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                # Print results — per-class count (+ OWOD unknown count when --owod-vis)
+                if getattr(opt, 'owod_vis', False):
+                    _unk_mask = det[:, -2] < float(opt.owod_tau)
+                    _kn_det = det[~_unk_mask]
+                    for c in _kn_det[:, -1].unique():
+                        n = (_kn_det[:, -1] == c).sum()
+                        s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "
+                    _n_unk = int(_unk_mask.sum())
+                    if _n_unk > 0:
+                        s += f"{_n_unk} unknown{'s' * (_n_unk > 1)}, "
+                else:
+                    for c in det[:, -1].unique():
+                        n = (det[:, -1] == c).sum()  # detections per class
+                        s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
@@ -286,8 +363,34 @@ def detect(opt):
 
                     if save_img or opt.save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness)
+                        # OWOD visualization: conf < owod_tau → "unknown"
+                        #   color: magenta (BGR 255,0,255) — visdrone palette 와 무충돌
+                        #   label: known box 와 동일 규칙 (--hide-labels/--hide-conf 존중)
+                        #          plot_one_box 내부에서 글씨는 항상 흰색 (255,255,255), 배경은 box color
+                        #   thickness: 2 (얇게 — 작은 객체 가림 최소화)
+                        if getattr(opt, 'owod_vis', False) and float(conf) < float(opt.owod_tau):
+                            unk_label = None if opt.hide_labels else (
+                                'unknown' if opt.hide_conf else f'unknown {conf:.2f}')
+                            col_box = (255, 0, 255)
+                            if getattr(opt, 'small_vis', False):
+                                plot_one_box_small(xyxy, im0, label=unk_label, color=col_box,
+                                                   line_thickness=opt.line_thickness,
+                                                   font_size=opt.small_font_size,
+                                                   font_thickness=opt.small_font_thickness)
+                            else:
+                                plot_one_box(xyxy, im0, label=unk_label, color=col_box,
+                                             line_thickness=opt.line_thickness)
+                        else:
+                            label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
+                            col_box = colors(c, True)
+                            if getattr(opt, 'small_vis', False):
+                                plot_one_box_small(xyxy, im0, label=label, color=col_box,
+                                                   line_thickness=opt.line_thickness,
+                                                   font_size=opt.small_font_size,
+                                                   font_thickness=opt.small_font_thickness)
+                            else:
+                                plot_one_box(xyxy, im0, label=label, color=col_box,
+                                             line_thickness=opt.line_thickness)
                         if opt.save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
@@ -302,10 +405,8 @@ def detect(opt):
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == 'image':
-                    if opt.view_cluster:
-                        cv2.imwrite(f'{save_dir}/{image_name}_4_pred.jpg', im0)
-                    else:
-                        cv2.imwrite(save_path, im0)
+                    # Always save as _pred.jpg for ESOD-style consistent naming (attn/cluster/pred/gt)
+                    cv2.imwrite(f'{save_dir}/{image_name}_pred.jpg', im0)
                 else:  # 'video' or 'stream'
                     if vid_path != save_path:  # new video
                         vid_path = save_path
@@ -325,29 +426,7 @@ def detect(opt):
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         print(f"Results saved to {save_dir}{s}")
 
-    # ── EDL routing 통계 출력 ─────────────────────────────────────────────
-    if _hmp is not None:
-        rs = _routing_stats
-        n = rs['n_images']
-        n_ev = rs['n_edl_active']
-        n_cap = rs['n_cap_only']
-        n_no = rs['n_no_cap']
-        print('\n[EDL Routing Statistics]')
-        print('  Total images (batch slots) : %d' % n)
-        print('  Kcap=%d  rho=%.2f  lambda=%.2f' % (
-            _hmp.max_patches, _hmp.explore_ratio, _hmp.explore_lambda))
-        print('  No cap needed  (clusters <= Kcap) : %d  (%.1f%%)' % (n_no,  100.*n_no /max(n,1)))
-        print('  Cap w/ EDL     (vacuity used)     : %d  (%.1f%%)' % (n_ev,  100.*n_ev /max(n,1)))
-        print('  Cap w/o EDL    (vacuity=None)     : %d  (%.1f%%)' % (n_cap, 100.*n_cap/max(n,1)))
-        if n_ev > 0:
-            print('  Sure patches   (K0) avg per cap  : %.1f' % (rs['sure_total']    / n_ev))
-            print('  Explore patches(K1) avg per cap  : %.1f' % (rs['explore_total'] / n_ev))
-        if rs['clusters_before'] > 0:
-            print('  Avg clusters before cap : %.1f' % (rs['clusters_before'] / max(n_ev+n_cap, 1)))
-            print('  Avg clusters after  cap : %.1f' % (rs['clusters_after']  / max(n_ev+n_cap, 1)))
-        if n_ev == 0 and n_cap == 0:
-            print('  --> EDL routing never triggered (all images had <= Kcap clusters)')
-    # ─────────────────────────────────────────────────────────────────────────
+    # (EDL routing statistics — silenced for OWOD mode; 활성화하려면 opt.verbose_routing 추가)
 
     print(f'Done. ({time.time() - t0:.3f}s)')
 
@@ -377,6 +456,12 @@ if __name__ == '__main__':
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
+    parser.add_argument('--owod-vis', action='store_true', help='OWOD visualization: conf<owod_tau detection을 magenta unknown 박스로')
+    parser.add_argument('--owod-tau', type=float, default=0.1, help='OWOD unknown 분류 threshold (conf<tau → unknown)')
+    parser.add_argument('--owod-unknown', type=str, default='', help='OWOD GT 시각화용 unknown class indices (예: "6,7"). 해당 class GT 도 magenta+"unknown" 표시')
+    parser.add_argument('--small-vis', action='store_true', help='작은 객체용 시각화: 얇은 박스선 + 작은 outlined 텍스트 + label collision 회피 배치')
+    parser.add_argument('--small-font-size', type=float, default=0.4, help='작은 객체 시각화 font scale (cv2 fontScale)')
+    parser.add_argument('--small-font-thickness', type=int, default=1, help='작은 객체 시각화 font thickness')
     parser.add_argument('--view-cluster', action='store_true', help='visualize clusters')
     parser.add_argument('--view-center', action='store_true', help='visualize heatmap centers')
     opt = parser.parse_args()

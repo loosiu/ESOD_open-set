@@ -679,38 +679,98 @@ class HeatMapParser(nn.Module):
         assert len(heatmaps) <= 3
 
         # ==========================================================
-        # (A) 중요: heatmaps 구조가 두 가지일 수 있음
-        # 1) [B,2,H,W] 하나로 오는 경우
-        # 2) [B,1,H,W] 두 개가 list로 오는 경우 -> cat 해야 EDL로 해석 가능
+        # heatmaps 구조 (4가지 케이스):
+        # 1) [tensor[B,1,H,W]]                                       → 기존 ESOD (heat only)
+        # 2) [tensor[B,2,H,W]]                                       → EDL only (vacuity)
+        # 3) [heat[B,1,H,W], edl[B,2,H,W]]                           → Dual + max fusion (raw vacuity)
+        # 4) [heat[B,1,H,W], edl[B,2,H,W], vacuity_cal[B,1,H,W]]     → Dual + max + Calibration ⭐
         # ==========================================================
-        if len(heatmaps) >= 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 1:
-            # (bg,obj) 두 개를 2채널로 합침
-            mask_raw = torch.cat([heatmaps[0], heatmaps[1]], dim=1).detach()  # [B,2,H,W]
-        else:
-            mask_raw = heatmaps[0].detach()  # [B,C,H,W] (C=1 or 2)
-
         vacuity = None
+        prob = None
 
-        # ---------------------------
-        # 1) Heatmap parsing
-        # ---------------------------
-        if mask_raw.shape[1] == 1:
-            mask_pred = mask_raw
-            if torch.max(mask_pred) > 1.0 or torch.min(mask_pred) < 0.0:
-                mask_pred = mask_pred.sigmoid()
-            mask_pred = mask_pred[:, 0, :, :].detach()  # [B,H,W]
+        is_dual_cal = (len(heatmaps) == 3 and
+                       heatmaps[0].shape[1] == 1 and
+                       heatmaps[1].shape[1] == 2 and
+                       heatmaps[2].shape[1] == 1)
+        is_dual_max = (len(heatmaps) == 2 and
+                       heatmaps[0].shape[1] == 1 and
+                       heatmaps[1].shape[1] == 2)
 
-        elif mask_raw.shape[1] == 2:
-            # EDL: vacuity 맵으로 객체 탐지 (heatmap/prob 사용하지 않음)
-            evidence = F.softplus(mask_raw)   # [B,2,H,W] >= 0
+        if is_dual_cal:
+            # === Dual fusion (calib-gating OR 3-C noisy-OR per ESOD_ROLE_DUAL env) ===
+            # heatmaps = [heat(1ch), edl(2ch), gate(1ch)]
+            # default       : F=(1-w)·prob_h + w·p_e, w=σ(gate)·(1-u)
+            # ESOD_ROLE_DUAL=1: F=1-(1-prob_h)*(1-p_e)  noisy-OR (3-C role-separated)
+            from utils import edl_det as _edl_det_mod
+            heat_raw = heatmaps[0].detach()
+            edl_raw  = heatmaps[1].detach()
+            gate_raw = heatmaps[2].detach()
+            _F4 = _edl_det_mod.fuse_dual_seg(heat_raw, edl_raw, gate_raw)   # [B,1,H,W]
+            mask_pred = _F4[:, 0].detach()                                 # [B,H,W]
+            # vacuity는 monitoring 용으로 그대로 (EDL branch 자체 vacuity)
+            _ev = F.softplus(edl_raw); _al = _ev + 1.0
+            vacuity = (2.0 / _al.sum(dim=1)).detach()
+            mask_raw = edl_raw
+
+        elif is_dual_max:
+            # === Dual + max fusion (legacy) ===
+            heat_raw = heatmaps[0].detach()
+            edl_raw  = heatmaps[1].detach()
+
+            prob = heat_raw[:, 0].sigmoid()
+            evidence = F.softplus(edl_raw)
             alpha = evidence + 1.0
-            S = alpha.sum(dim=1)              # [B,H,W]
-            vacuity = (2.0 / S).detach()      # vacuity [B,H,W], 0~1
-            # vacuity가 높은 곳 = 불확실한 곳 = 객체 후보
-            mask_pred = vacuity               # prob 대신 vacuity를 사용
+            S = alpha.sum(dim=1)
+            vacuity = (2.0 / S).detach()
+
+            mask_pred = torch.max(prob, vacuity).detach()
+            mask_raw = edl_raw
+
+        elif len(heatmaps) >= 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 1:
+            # legacy: (bg, obj) two 1ch heads merged into 2ch
+            mask_raw = torch.cat([heatmaps[0], heatmaps[1]], dim=1).detach()
+            evidence = F.softplus(mask_raw)
+            alpha = evidence + 1.0
+            S = alpha.sum(dim=1)
+            vacuity = (2.0 / S).detach()
+            mask_pred = vacuity
 
         else:
-            raise ValueError(f"Unexpected heatmap channels after merge: {mask_raw.shape[1]}")
+            mask_raw = heatmaps[0].detach()
+            if mask_raw.shape[1] == 1:
+                mp = mask_raw
+                if torch.max(mp) > 1.0 or torch.min(mp) < 0.0:
+                    mp = mp.sigmoid()
+                mask_pred = mp[:, 0, :, :].detach()
+                prob = mask_pred
+            elif mask_raw.shape[1] == 2:
+                # Single 2ch EDL: u-aware keep
+                #   B-1 (sum, default): mask = p_obj + gamma * u
+                #   B-2 (dual OR)     : keep = (p_obj > tau_obj) | (u > tau_u); mask = (p_obj + gamma*u) * keep
+                # ESOD_VAC_KEEP_MODE: 'sum' (default) or 'dual'
+                evidence = F.softplus(mask_raw)
+                alpha = evidence + 1.0
+                S = alpha.sum(dim=1)                                    # [B, H, W]
+                p_obj = (alpha[:, 1] / S).detach()                      # belief obj (ch1)
+                vacuity = (2.0 / S).detach()
+                import os as _os_uaw
+                _gamma = float(_os_uaw.environ.get('ESOD_VAC_GAMMA', '0.5'))
+                _keep_mode = _os_uaw.environ.get('ESOD_VAC_KEEP_MODE', 'sum').strip().lower()
+                if _keep_mode == 'dual':
+                    # B-2: OR-rule. Two independent score paths, then max → NMS-friendly.
+                    # u path is scaled so that u=tau_u → 0.5 (safely above default thresh=0.3).
+                    _tau_obj = float(_os_uaw.environ.get('ESOD_VAC_TAU_OBJ', '0.1'))
+                    _tau_u   = float(_os_uaw.environ.get('ESOD_VAC_TAU_U',   '0.13'))
+                    keep_obj = p_obj > _tau_obj
+                    keep_u   = vacuity > _tau_u
+                    score_p = torch.where(keep_obj, p_obj, torch.zeros_like(p_obj))
+                    _u_scale = 0.5 / max(_tau_u, 1e-6)
+                    score_u = torch.where(keep_u, vacuity * _u_scale, torch.zeros_like(vacuity))
+                    mask_pred = torch.maximum(score_p, score_u).detach()
+                else:
+                    mask_pred = (p_obj + _gamma * vacuity).detach()     # u-aware patch score (B-1)
+            else:
+                raise ValueError(f"Unexpected heatmap channels: {mask_raw.shape[1]}")
 
         # ---------------------------
         # DEBUG ONCE: 학습/추론 상관없이 첫 호출에서 heatmaps 구조를 확정 출력
@@ -740,8 +800,10 @@ class HeatMapParser(nn.Module):
             return self.uni_slicer(x, mask_pred, self.ratio, self.threshold * 1. + 0., device=device)
 
         # ---------------------------
-        # 3) Inference: adaptive slicing → patchify (no routing/cap)
+        # 3) Inference: adaptive slicing → patchify (ESOD 표준)
         # ---------------------------
+        # mask_pred는 이미 pixel-level fusion된 신호 (F = (1-w)·prob + w·p_e, w=σ(gate)·(1-u))
+        # ada_slicer가 이를 보고 patch 자동 생성 → 추가 필터링 불필요
         total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold * 1.0 + 0.)
 
         if getattr(self, 'cluster_only', False):
@@ -767,6 +829,44 @@ class HeatMapParser(nn.Module):
             b = torch.full_like(clusters[:, :1], bi)
             offsets.append(torch.cat((b, clusters), dim=1))
         return torch.cat(offsets)
+
+    @torch.no_grad()
+    def _filter_patches_by_vacuity(self, total_clusters, prob_map, vacuity_map,
+                                    conf_thresh=0.25):
+        """
+        방법 1: Patch-level Uncertainty Selection
+
+        각 patch의 confidence를 계산:
+            confidence = mean(prob) * (1 - mean(vacuity))
+
+        conf_thresh 미만의 patch는 제거 (uncertain / FP 후보 제거)
+
+        prob_map:    [B, H, W]
+        vacuity_map: [B, H, W]
+        total_clusters: list[Tensor[N,4]] (xyxy in feature-map coords)
+        """
+        filtered = []
+        for bi, clusters in enumerate(total_clusters):
+            if clusters.numel() == 0:
+                filtered.append(clusters)
+                continue
+            # 각 patch의 mean prob / vacuity 계산
+            keep = []
+            for j in range(clusters.shape[0]):
+                x1, y1, x2, y2 = clusters[j].long().tolist()
+                x2 = max(x2, x1 + 1)
+                y2 = max(y2, y1 + 1)
+                p_mean = prob_map[bi, y1:y2, x1:x2].mean()
+                v_mean = vacuity_map[bi, y1:y2, x1:x2].mean()
+                confidence = p_mean * (1.0 - v_mean)
+                if confidence >= conf_thresh:
+                    keep.append(j)
+            if len(keep):
+                filtered.append(clusters[torch.tensor(keep, device=clusters.device,
+                                                      dtype=torch.long)])
+            else:
+                filtered.append(clusters[:0])
+        return filtered
 
     @torch.no_grad()
     def ada_slicer_fast(self, mask_pred: torch.Tensor, ratio=8, threshold=0.3):
@@ -1399,6 +1499,24 @@ class YOLOv6Head(YOLOXHead):
         self.cls_pred = nn.Conv2d(c, nc * na, 1)
         self.reg_pred = nn.Conv2d(c, 4 * na, 1)
         self.obj_pred = nn.Conv2d(c, 1 * na, 1)
+        # EDL 병렬 evidence head (2채널: e_bg, e_obj). conf branch와 무관.
+        # zero-init → 시작 evidence=0, vacuity≈1 (최대 불확실). 학습으로만 evidence↑.
+        self.ev_pred = nn.Conv2d(c, 2 * na, 1)
+        nn.init.zeros_(self.ev_pred.weight); nn.init.zeros_(self.ev_pred.bias)
+        self.last_ev = None     # forward 후 [B, na, 2, ny, nx] (loss·eval 접근용)
+
+    def forward(self, x):
+        bs, _, ny, nx = x.shape
+        stem = self.stem(x)
+        cls_feat = self.cls_conv(stem)
+        reg_feat = self.reg_conv(stem)
+        cls = self.cls_pred(cls_feat).view(bs, self.na, self.nc, ny, nx)
+        reg = self.reg_pred(reg_feat).view(bs, self.na, 4, ny, nx)
+        obj = self.obj_pred(reg_feat).view(bs, self.na, 1, ny, nx)
+        # EDL: parallel evidence (학습은 IoU-aware R-EDL, inference 시 vacuity 계산 source)
+        self.last_ev = self.ev_pred(reg_feat).view(bs, self.na, 2, ny, nx)
+        y = torch.cat((reg, obj, cls), 2)
+        return y.view(bs, -1, ny, nx)
 
 
 ### graph ### 

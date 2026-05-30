@@ -33,9 +33,10 @@ backbone:
   #  [-1, 1, DCN, [256, 3, 1]],
   #  [-1, 1, SPP, [256, [5, 9, 13]]],
   # [-1, 1, ASPP, [256, [1, 2, 4, 6]]],
-  #  [[-1], 1, Segmenter, [1]],
-   [[-1], 1, Segmenter, [2]], # [1] -> [2]
-   [[4, -1], 1, HeatMapParser, [256, 8, 0.15]],  # 7, vacuity threshold (EDL)
+  #  [[-1], 1, Segmenter, [1]],     # 6: plain heat segmenter (ESOD baseline, BCE)
+   [[-1], 1, Segmenter, [2]],   # EDL segmenter (2ch) — EDL-OOD path
+  #  [[-1], 1, DualSegmenter, []],   # dual (heat 1ch + edl 2ch + gate 1ch)
+   [[4, -1], 1, HeatMapParser, [256, 8, 0.5]],  # 7, threshold 0.5 (ESOD와 동일, Gating fused [0,1])
 
    [-1, 1, Conv, [512, 3, 2]],  # 8-P4/16
    [-1, 9, C3, [512]],

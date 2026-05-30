@@ -420,6 +420,41 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             for x in self.labels:
                 x[:, 0] = 0
 
+        # OOD held-out class processing (training only) — env-based mode
+        # ESOD_HELD_OUT_CLASSES="6,7"           hold-out class indices
+        # ESOD_OWOD_MODE = "remove" (default)   label 완전 제거 (기존 baseline behavior)
+        #                = "ignore"             cls id 를 -1 로 remap (보존)
+        #                                       → train.py 가 m_weights 0 으로 segmenter ignore
+        #                                       → loss.py build_targets 가 -1 target skip
+        _ho_env = os.environ.get('ESOD_HELD_OUT_CLASSES', '').strip()
+        _owod_mode = os.environ.get('ESOD_OWOD_MODE', 'remove').strip().lower()
+        if _ho_env and augment:
+            _ho_set = set(int(c) for c in _ho_env.split(',') if c.strip())
+            if _owod_mode == 'ignore':
+                _n_ig = 0
+                for _lbl in self.labels:
+                    if _lbl.size:
+                        _ig_idx = np.array([int(c) in _ho_set for c in _lbl[:, 0]], dtype=bool)
+                        if _ig_idx.any():
+                            _n_ig += int(_ig_idx.sum())
+                            _lbl[_ig_idx, 0] = 999.0   # ignore class id (large sentinel — np.bincount safe)
+                print(f"{prefix}[ignore mode] remapped {_n_ig} instances of classes "
+                      f"{sorted(_ho_set)} → cls=-1 "
+                      f"(segmenter ignore via weight=0 + detect skip)")
+            else:
+                _n_drop = 0
+                _new_labels = []
+                for _lbl in self.labels:
+                    if _lbl.size:
+                        _keep = np.array([int(c) not in _ho_set for c in _lbl[:, 0]], dtype=bool)
+                        _n_drop += int((~_keep).sum())
+                        _new_labels.append(_lbl[_keep])
+                    else:
+                        _new_labels.append(_lbl)
+                self.labels = _new_labels
+                print(f"{prefix}[held-out filter] dropped {_n_drop} instances of classes "
+                      f"{sorted(_ho_set)} from training labels (eval untouched)")
+
         n = len(shapes)  # number of images
         bi = np.floor(np.arange(n) / batch_size).astype(np.int64)  # batch index
         nb = bi[-1] + 1  # number of batches

@@ -46,43 +46,102 @@ def edl_stats_one_batch(model, dataloader, device):
     model.eval()
 
     batch = next(iter(dataloader))
-    imgs = batch[0]  # dataloader가 뭘 더 주든 imgs는 0번
+    imgs = batch[0]
 
     imgs = imgs.to(device, non_blocking=True).float()
     imgs = norm_imgs(imgs, model)
 
-    # hm_only=True로 Segmenter 출력만 뽑기
     (pred_det, pred_seg), pred_masks = model(imgs, hm_only=True)
 
     if pred_masks is None or len(pred_masks) == 0:
         return {"ok": False, "reason": "pred_masks is None/empty"}
 
-    hm = pred_masks[0].detach()  # [B,C,H,W]
+    # === Dual + Gating: pred_masks = [heat(1ch), edl(2ch), gate-logit(1ch)] ===
+    if (len(pred_masks) == 3 and
+        pred_masks[0].shape[1] == 1 and
+        pred_masks[1].shape[1] == 2 and
+        pred_masks[2].shape[1] == 1):
+        heat = pred_masks[0].detach()
+        edl  = pred_masks[1].detach()
+        gate_logit = pred_masks[2].detach()
+        prob = heat[:, 0].sigmoid()
+        evidence = F.softplus(edl)
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=1)
+        v_raw = 2.0 / S                           # raw vacuity
+        gate = gate_logit[:, 0].sigmoid()         # learnable spatial gate ∈(0,1)
+
+        pf = prob.flatten().float() - prob.mean()
+        vf = v_raw.flatten().float() - v_raw.mean()
+        corr = (pf * vf).mean() / (pf.std(unbiased=False) * vf.std(unbiased=False) + 1e-12)
+
+        return {
+            "ok": True,
+            "mode": "dual_gate",
+            "heatmapC": "1+2+1",
+            "p_mean":     float(prob.mean()),
+            "p_max":      float(prob.max()),
+            "v_raw_mean": float(v_raw.mean()),
+            "v_raw_max":  float(v_raw.max()),
+            "gate_mean":  float(gate.mean()),
+            "gate_min":   float(gate.min()),
+            "gate_max":   float(gate.max()),
+            "corr":       float(corr.item()),
+        }
+
+    # === Dual + max: pred_masks = [heat(1ch), edl(2ch)] ===
+    if (len(pred_masks) == 2 and
+        pred_masks[0].shape[1] == 1 and
+        pred_masks[1].shape[1] == 2):
+        heat = pred_masks[0].detach()
+        edl  = pred_masks[1].detach()
+        prob = heat[:, 0].sigmoid()
+        evidence = F.softplus(edl)
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=1)
+        v = 2.0 / S
+
+        pf = prob.flatten().float() - prob.mean()
+        vf = v.flatten().float() - v.mean()
+        corr = (pf * vf).mean() / (pf.std(unbiased=False) * vf.std(unbiased=False) + 1e-12)
+
+        return {
+            "ok": True,
+            "mode": "dual",
+            "heatmapC": "1+2",
+            "p_mean": float(prob.mean()),
+            "p_max":  float(prob.max()),
+            "v_mean": float(v.mean()),
+            "v_max":  float(v.max()),
+            "corr":   float(corr.item()),
+        }
+
+    # === EDL only case (legacy): pred_masks[0] is 2ch ===
+    hm = pred_masks[0].detach()
     C = hm.shape[1]
     if C != 2:
-        return {"ok": False, "heatmapC": int(C), "reason": "heatmapC != 2"}
+        return {"ok": False, "heatmapC": int(C),
+                "reason": f"unexpected pred_masks structure (len={len(pred_masks)}, C={C})"}
 
     evidence = F.softplus(hm)
     alpha = evidence + 1.0
-    S = alpha.sum(dim=1)        # [B,H,W]
+    S = alpha.sum(dim=1)
     p = alpha[:, 1] / S
     v = 2.0 / S
 
-    pf = p.flatten().float()
-    vf = v.flatten().float()
-    pf = pf - pf.mean()
-    vf = vf - vf.mean()
+    pf = p.flatten().float() - p.mean()
+    vf = v.flatten().float() - v.mean()
     corr = (pf * vf).mean() / (pf.std(unbiased=False) * vf.std(unbiased=False) + 1e-12)
-    corr = float(corr.item())
 
     return {
         "ok": True,
+        "mode": "edl_only",
         "heatmapC": 2,
         "p_mean": float(p.mean()),
-        "p_max": float(p.max()),
+        "p_max":  float(p.max()),
         "v_mean": float(v.mean()),
-        "v_max": float(v.max()),
-        "corr": float(corr),
+        "v_max":  float(v.max()),
+        "corr":   float(corr.item()),
     }
     
 def train(hyp, opt, device, tb_writer=None):
@@ -274,7 +333,12 @@ def train(hyp, opt, device, tb_writer=None):
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
-    mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
+    # OWOD ignore mode: cls>=100 (sentinel 999) 은 max-label assertion 에서 제외
+    _all_cls = np.concatenate(dataset.labels, 0)[:, 0]
+    import os as _os_mlc
+    if _os_mlc.environ.get('ESOD_OWOD_MODE', '').strip().lower() == 'ignore':
+        _all_cls = _all_cls[_all_cls < 100]
+    mlc = _all_cls.max() if len(_all_cls) else 0  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
@@ -360,6 +424,24 @@ def train(hyp, opt, device, tb_writer=None):
             imgs = norm_imgs(imgs, model)
             masks = masks.to(device, non_blocking=True).float()
             m_weights = m_weights.to(device, non_blocking=True).float()
+
+            # OWOD ignore mode: hold-out class GT region 의 m_weights 를 0 으로 set
+            #   → segmenter loss (BCE 또는 EDL Dirichlet MSE) 에서 자동 제외 (weight=0 ⇒ contribution 0)
+            #   ESOD_OWOD_MODE=ignore 일 때만 활성. (3-way ambiguous zone 없이 단순 hold-out ignore 만)
+            import os as _os_owod
+            if _os_owod.environ.get('ESOD_OWOD_MODE', '').strip().lower() == 'ignore':
+                _ho_targets = targets[targets[:, 1] >= 100]   # ignore sentinel (999)
+                if len(_ho_targets) > 0:
+                    _Hm, _Wm = m_weights.shape[-2:]
+                    for _t in _ho_targets:
+                        _bi = int(_t[0].item())
+                        _cx, _cy, _w, _h = _t[2:6].tolist()
+                        _x1 = max(0, int((_cx - _w / 2) * _Wm))
+                        _x2 = min(_Wm, int((_cx + _w / 2) * _Wm) + 1)
+                        _y1 = max(0, int((_cy - _h / 2) * _Hm))
+                        _y2 = min(_Hm, int((_cy + _h / 2) * _Hm) + 1)
+                        if _x2 > _x1 and _y2 > _y1:
+                            m_weights[_bi, 0, _y1:_y2, _x1:_x2] = 0.0
 
             # ============================
             # SecondLook debug call during training (학습 중 적용 여부 바로 확인)
@@ -459,12 +541,19 @@ def train(hyp, opt, device, tb_writer=None):
             try:
                 edl_stats = edl_stats_one_batch(ema.ema if ema is not None else model, testloader, device)
                 if edl_stats.get("ok", False):
-                    print(f"[EDL][epoch {epoch}] C={edl_stats['heatmapC']} "
-                        f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
-                        f"v_mean={edl_stats['v_mean']:.4f} v_max={edl_stats['v_max']:.4f} "
-                        f"corr={edl_stats['corr']:.4f}")
+                    if 'gate_mean' in edl_stats:
+                        # Dual + Learnable Spatial Gating mode
+                        print(f"[EDL][epoch {epoch}] mode={edl_stats['mode']} C={edl_stats['heatmapC']} "
+                              f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
+                              f"v_raw_mean={edl_stats['v_raw_mean']:.4f} v_raw_max={edl_stats['v_raw_max']:.4f} "
+                              f"gate_mean={edl_stats['gate_mean']:.4f} gate_min={edl_stats['gate_min']:.4f} gate_max={edl_stats['gate_max']:.4f} "
+                              f"corr={edl_stats['corr']:.4f}")
+                    else:
+                        print(f"[EDL][epoch {epoch}] mode={edl_stats.get('mode','?')} C={edl_stats['heatmapC']} "
+                              f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
+                              f"v_mean={edl_stats['v_mean']:.4f} v_max={edl_stats['v_max']:.4f} "
+                              f"corr={edl_stats['corr']:.4f}")
                 else:
-                    # EDL이 안 걸리면 이유까지 출력
                     print(f"[EDL][epoch {epoch}] NOT_OK "
                         f"heatmapC={edl_stats.get('heatmapC', None)} reason={edl_stats.get('reason', '')}")
             except Exception as e:

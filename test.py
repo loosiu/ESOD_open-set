@@ -51,6 +51,7 @@ def test(data,
          use_gt=True,
          sparse_head=False,
          hm_metric=False,
+         calib=False,
          opt=None):
     # Initialize/load model and set device
     training = model is not None
@@ -89,6 +90,16 @@ def test(data,
     if sparse_head:
         model.model[-1].set_sparse()
     model.eval()
+
+    # threshold sweep: override HeatMapParser.threshold (inference-only knob)
+    if opt is not None and getattr(opt, 'hm_thres', None) is not None:
+        from models.common import HeatMapParser
+        _n = 0
+        for _m in model.modules():
+            if isinstance(_m, HeatMapParser):
+                _m.threshold = opt.hm_thres
+                _n += 1
+        print(f'[hm-thres override] HeatMapParser.threshold -> {opt.hm_thres}  ({_n} module(s))')
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
@@ -111,6 +122,8 @@ def test(data,
                                        prefix=colorstr(f'{task}: '))[0]
 
     seen = 0
+    miss_records = []  # err-diag: per-GT (cls, native-space area, bucket: ok/cls/loc/miss)
+    fp_records = []    # err-diag: high-conf(conf>=0.25) preds (bkg/loc/hit)
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
@@ -124,6 +137,7 @@ def test(data,
     hm_stats    = dict(tp=0, fp=0, tn=0, fn=0, obj_hit=0, obj_total=0)
     patch_stats = dict(obj_recalled=0, obj_total=0, gt_coverage_sum=0.0,
                        bg_patches=0, total_patches=0)
+    dump_buf = [] if (opt is not None and getattr(opt, 'dump_dets', None)) else None
 
     # ── EDL routing 통계 monkey-patch ────────────────────────────────────────
     _routing_stats = dict(n_images=0, n_edl_active=0, n_cap_only=0, n_no_cap=0,
@@ -160,9 +174,9 @@ def test(data,
             if self.training:
                 return self.uni_slicer(x_feat, mask_pred, self.ratio, self.threshold, device=device_)
             total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold)
-            Kcap = int(self.max_patches or 0)
-            rho  = float(self.explore_ratio or 0.0)
-            lam  = float(self.explore_lambda or 0.0)
+            Kcap = int(getattr(self, 'max_patches', 0) or 0)
+            rho  = float(getattr(self, 'explore_ratio', 0.0) or 0.0)
+            lam  = float(getattr(self, 'explore_lambda', 0.0) or 0.0)
             _rs['n_images'] += bs
             patches, offsets = [], []
             for bi, clusters in enumerate(total_clusters):
@@ -211,6 +225,42 @@ def test(data,
         _hmp._orig_forward = _hmp.forward
         _hmp.forward = _types.MethodType(_patched_forward, _hmp)
     # ─────────────────────────────────────────────────────────────────────────
+    calib_eval = None
+    if calib:
+        from utils.calibration import CalibrationEval, uncertainty_maps
+        calib_eval = CalibrationEval()
+
+    # OOD eval (held-out class) — opt.ood_eval & opt.held_out_classes
+    ood_eval = None
+    if opt is not None and getattr(opt, 'ood_eval', False):
+        from utils.calibration import OODEval, uncertainty_maps as _um2
+        ho = [int(c) for c in str(getattr(opt, 'held_out_classes', '')).split(',') if c.strip()]
+        if not ho:
+            print('[OOD] --ood-eval 지정되었지만 --held-out-classes 비어있음 → skip')
+        else:
+            ood_eval = OODEval(ho)
+            if calib_eval is None:
+                # uncertainty_maps 호출이 calib path 외부에서도 필요해짐
+                from utils.calibration import uncertainty_maps  # noqa: F811
+
+    # OWOD eval (ORE/OW-DETR style): U-Recall, WI, A-OSE
+    owod_eval = None
+    if opt is not None and getattr(opt, 'owod_eval', False):
+        from utils.owod_eval import OWODEval
+        kn = [int(c) for c in str(getattr(opt, 'owod_known', '')).split(',') if c.strip()]
+        un = [int(c) for c in str(getattr(opt, 'owod_unknown', '')).split(',') if c.strip()]
+        if not kn or not un:
+            print('[OWOD] --owod-eval 지정됐지만 --owod-known/--owod-unknown 비어있음 → skip')
+        else:
+            owod_eval = OWODEval(known_classes=kn, unknown_classes=un,
+                                 method=getattr(opt, 'owod_method', 'conf'),
+                                 tau=getattr(opt, 'owod_tau', 0.1))
+            # uncertainty_maps import (calib/ood path 외에도 owod 에서 필요)
+            if calib_eval is None and ood_eval is None:
+                from utils.calibration import uncertainty_maps  # noqa: F811
+            print(f'[OWOD] known={sorted(kn)}, unknown={sorted(un)}, '
+                  f'method={getattr(opt, "owod_method", "conf")}, '
+                  f'tau={getattr(opt, "owod_tau", 0.1)}')
     for batch_i, (img, targets, masks, m_weights, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
     # for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
@@ -244,21 +294,40 @@ def test(data,
         infer_times.append(time_synchronized() - t)
         t0 += infer_times[-1]
         train_out = (p_det, p_seg)
+        umaps = uncertainty_maps(p_seg) if (calib_eval is not None or ood_eval is not None or owod_eval is not None) else None
         if hm_metric:
-            # EDL (C=2) → 1채널 logit으로 변환 (mask_pr/sparse_recall은 sigmoid 후 threshold)
-            hm_raw = p_seg[0]
-            if hm_raw.shape[1] == 2:
-                import torch.nn.functional as _F
-                _ev = _F.softplus(hm_raw)
-                _al = _ev + 1.0
-                _p  = (_al[:, 1:2] / _al.sum(dim=1, keepdim=True)).clamp(1e-6, 1 - 1e-6)
-                hm_1ch = torch.log(_p / (1.0 - _p))  # logit: sigmoid(hm_1ch) == p_obj
+            # 1채널 logit 변환 (mask_pr/sparse_recall은 sigmoid 후 threshold)
+            import torch.nn.functional as _F
+            # Dual fusion (calib-gating or 3-C noisy-OR per ESOD_ROLE_DUAL env)
+            if (len(p_seg) == 3 and p_seg[0].shape[1] == 1
+                    and p_seg[1].shape[1] == 2 and p_seg[2].shape[1] == 1):
+                from utils import edl_det as _edl_det_mod
+                fused = _edl_det_mod.fuse_dual_seg(
+                    p_seg[0], p_seg[1], p_seg[2]).clamp(1e-6, 1 - 1e-6)
+                hm_1ch = torch.log(fused / (1.0 - fused))  # logit form (mask_pr 용)
+                hm_for_quality = p_seg
+            elif len(p_seg) == 2 and p_seg[0].shape[1] == 1 and p_seg[1].shape[1] == 2:
+                # Dual + max
+                _heat = p_seg[0]; _edl = p_seg[1]
+                prob_heat = _heat.sigmoid()
+                _ev = _F.softplus(_edl); _al = _ev + 1.0
+                vac = 2.0 / _al.sum(dim=1, keepdim=True)
+                fused = torch.max(prob_heat, vac).clamp(1e-6, 1 - 1e-6)
+                hm_1ch = torch.log(fused / (1.0 - fused))
+                hm_for_quality = p_seg
             else:
-                hm_1ch = hm_raw
+                hm_raw = p_seg[0]
+                if hm_raw.shape[1] == 2:
+                    _ev = _F.softplus(hm_raw); _al = _ev + 1.0
+                    _p  = (_al[:, 1:2] / _al.sum(dim=1, keepdim=True)).clamp(1e-6, 1 - 1e-6)
+                    hm_1ch = torch.log(_p / (1.0 - _p))
+                else:
+                    hm_1ch = hm_raw
+                hm_for_quality = p_seg[0]
             mask_pr(masks, hm_1ch, targets, m_p, m_r)
             sparse_recall(hm_1ch, targets, sp_r)
             attr.append(targets[:, [1,4,5]])  # class, width, height
-            heatmap_quality_update(p_seg[0], masks, targets, hm_stats)
+            heatmap_quality_update(hm_for_quality, masks, targets, hm_stats)
 
         # Compute loss
         if compute_loss:
@@ -276,6 +345,7 @@ def test(data,
             if not training and opt.task == 'measure':
                 lbucket.add(len(clusters[0]), gflops[-1], infer_times[-1])
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+        out_raw = out if (out is not None and isinstance(out, torch.Tensor)) else None  # pre-NMS (dump용)
         if out is not None:
             if isinstance(out, torch.Tensor):
                 t = time_synchronized()
@@ -371,8 +441,98 @@ def test(data,
                                 if len(detected) == nl:  # all targets already located in image
                                     break
 
+                if opt is not None and getattr(opt, 'miss_diag', False):
+                    _wh = (tbox[:, 2:4] - tbox[:, :2]).clamp(min=0)
+                    _ar = _wh[:, 0] * _wh[:, 1]
+                    if predn.shape[0]:
+                        _iou = box_iou(predn[:, :4], tbox)        # [npred, nl] class-agnostic
+                        _pc = predn[:, 5]
+                        for _t in range(nl):
+                            _gc = int(tcls_tensor[_t]); _col = _iou[:, _t]
+                            if ((_col >= 0.5) & (_pc == _gc)).any():   _bk = 'ok'    # 정상 검출
+                            elif (_col >= 0.5).any():                  _bk = 'cls'   # 국소화O, 분류X
+                            elif ((_col >= 0.1) & (_pc == _gc)).any(): _bk = 'loc'   # 박스 나쁨
+                            else:                                      _bk = 'miss'  # 완전 놓침
+                            miss_records.append((_gc, float(_ar[_t]), _bk))
+                        _hi = predn[:, 4] >= 0.25                 # 고신뢰 예측의 FP 유형
+                        if _hi.any():
+                            for _v in _iou[_hi].max(1)[0].tolist():
+                                fp_records.append('bkg' if _v < 0.1 else ('loc' if _v < 0.5 else 'hit'))
+                    else:
+                        for _t in range(nl):
+                            miss_records.append((int(tcls_tensor[_t]), float(_ar[_t]), 'miss'))
+
             # Append statistics (correct, conf, pcls, tcls)
+            if calib_eval is not None:
+                calib_eval.add_image(pred, correct[:, 0], umaps, si, img.shape[-2])
+            if ood_eval is not None and nl:
+                # GT in input space: [cls, x1, y1, x2, y2]
+                _gxyxy = xywh2xyxy(labels[:, 1:5])
+                _gts = torch.cat((labels[:, 0:1], _gxyxy), dim=1)
+                _vac = (umaps['vac'][si] if (umaps is not None and 'vac' in umaps) else None)
+                # Phase 2: Detect parallel ev_pred vacuity map (image-space, per image)
+                _det_module = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]
+                _dvi = getattr(_det_module, 'last_det_vac_image', None)
+                _det_vac = _dvi[si] if (_dvi is not None and si < _dvi.shape[0]) else None
+                ood_eval.add_image(_gts, pred, _vac, img.shape[-2], det_vac_map=_det_vac)
+
+            if owod_eval is not None and nl:
+                # OWOD: pred=[N,6] xyxy/conf/cls, gts=[M,5] cls/xyxy 둘 다 input space
+                _gxyxy = xywh2xyxy(labels[:, 1:5])
+                _gts = torch.cat((labels[:, 0:1], _gxyxy), dim=1)
+                # method='vacuity' 일 때 — detection 별 vacuity 계산
+                # source priority: env-aware (학습 시 활성화한 EDL 위치 따라)
+                #   ESOD_EVIDENTIAL_CLS=1   → last_cls_vac_image (EOD)
+                #   ESOD_EDL_DET_LAMBDA>0   → last_det_vac_image (Phase 2 ev_pred)
+                #   기본                     → umaps['vac']        (Segmenter EDL — 이번 시도)
+                _vac_per_det = None
+                if getattr(opt, 'owod_method', 'conf') == 'vacuity' and len(pred):
+                    import os as _os_v
+                    _ev_cls_on = _os_v.environ.get('ESOD_EVIDENTIAL_CLS', '').strip() == '1'
+                    try:
+                        _edl_det_lam = float(_os_v.environ.get('ESOD_EDL_DET_LAMBDA', '0'))
+                    except Exception:
+                        _edl_det_lam = 0.0
+                    _det_module = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]
+                    if _ev_cls_on:
+                        _vac_src = getattr(_det_module, 'last_cls_vac_image', None)
+                    elif _edl_det_lam > 0:
+                        _vac_src = getattr(_det_module, 'last_det_vac_image', None)
+                    elif umaps is not None and 'vac' in umaps:
+                        _vac_src = umaps['vac']
+                    else:
+                        _vac_src = None
+                    if _vac_src is not None and si < _vac_src.shape[0]:
+                        _vm = _vac_src[si].detach().cpu().numpy()
+                        _H, _W = _vm.shape
+                        _stride = float(img.shape[-2]) / float(_H)
+                        _pn = pred.detach().cpu().numpy()
+                        _vac = []
+                        for _r in range(len(_pn)):
+                            _x1, _y1, _x2, _y2 = _pn[_r, :4]
+                            _gx1 = int(min(max(_x1 / _stride, 0), _W - 1))
+                            _gx2 = int(min(max(_x2 / _stride, 0), _W - 1))
+                            _gy1 = int(min(max(_y1 / _stride, 0), _H - 1))
+                            _gy2 = int(min(max(_y2 / _stride, 0), _H - 1))
+                            _vac.append(float(_vm[_gy1:_gy2 + 1, _gx1:_gx2 + 1].mean()))
+                        _vac_per_det = torch.tensor(_vac, dtype=torch.float32)
+                owod_eval.add_image(pred, _gts, vac_per_det=_vac_per_det)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+
+            # verify-head 학습용 검출 덤프 (--dump-dets): post-NMS 검출 (Step0와 동일 set)
+            if dump_buf is not None and out_raw is not None and len(pred):
+                from models.verify_head import build_verify_features
+                cand = out_raw[si]                                       # pre-NMS [N,5+nc] 입력공간 xywh
+                csc = cand[:, 4] * cand[:, 5:5 + nc].max(1).values
+                cand = cand[csc > conf_thres]                            # conf 필터로 축소
+                if len(cand):
+                    midx = torch.cdist(pred[:, :4],                      # post-NMS→pre-NMS 행 복원
+                                       xywh2xyxy(cand[:, :4])).argmin(1)
+                    rows = cand[midx]                                    # [M,5+nc] 풀 검출벡터
+                    feats = build_verify_features(rows[:, :5 + nc], (width, height), nc)
+                    dump_buf.append((feats.cpu(), correct[:, 0].float().cpu(),
+                                     pred[:, 4].cpu(),
+                                     torch.full((len(pred),), seen, dtype=torch.long)))
 
         # Plot images
         if plots and batch_i < 3:
@@ -380,6 +540,15 @@ def test(data,
             Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
             f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
             Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+
+    # verify-head 검출 덤프 저장 (--dump-dets)
+    if dump_buf is not None and len(dump_buf):
+        feat = torch.cat([d[0] for d in dump_buf]).numpy()
+        tp   = torch.cat([d[1] for d in dump_buf]).numpy()
+        conf = torch.cat([d[2] for d in dump_buf]).numpy()
+        imgi = torch.cat([d[3] for d in dump_buf]).numpy()
+        np.savez(opt.dump_dets, feat=feat, tp=tp, conf=conf, img=imgi, nc=nc)
+        print(f'[dump-dets] {feat.shape[0]} dets, {100.0 * tp.mean():.1f}% TP -> {opt.dump_dets}')
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -391,6 +560,25 @@ def test(data,
     else:
         nt = torch.zeros(1)
     bpr, occupy = statistic_items[0] / nt.sum(), (statistic_items[1] + 1e-6) / (statistic_items[2] + 1e-6)
+    if calib_eval is not None:
+        calib_eval.summarize(save_dir)
+    if ood_eval is not None:
+        ood_eval.summarize(save_dir)
+    if owod_eval is not None:
+        owod_eval.summarize(save_dir)
+        # Per-class mAP에서 known-only mAP_K 계산
+        if 'ap_class' in dir() and len(stats):
+            try:
+                kn_set = set(int(c) for c in str(getattr(opt, 'owod_known', '')).split(',') if c.strip())
+                kn_idx = [i for i, c in enumerate(ap_class) if int(c) in kn_set]
+                if kn_idx:
+                    map50_K = ap50[kn_idx].mean()
+                    map_K   = ap[kn_idx].mean()
+                    print(f'  [OWOD] mAP_K @0.5    = {map50_K:.4f}  '
+                          f'(known {sorted(kn_set)} only)')
+                    print(f'  [OWOD] mAP_K @.5:.95 = {map_K:.4f}\n')
+            except Exception as e:
+                print(f'  [OWOD] mAP_K 계산 경고: {e}')
     if hm_metric:
         sp_r, m_p, m_r = torch.stack(sp_r), torch.stack(m_p), torch.stack(m_r)
         mp, mr, bpr = m_p.mean().item(), m_r.mean().item(), sp_r.mean().item()
@@ -426,6 +614,76 @@ def test(data,
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i], bpr, occupy))
+
+    # Step 0 - Oracle re-scoring upper bound + raw-conf AUROC
+    if opt is not None and getattr(opt, 'oracle', False) and len(stats) and stats[0].any():
+        correct_all = stats[0]                       # [N, niou] bool TP-matrix
+        conf_all    = stats[1].astype(np.float64)    # [N] raw confidence
+        pcls_all, tcls_all = stats[2], stats[3]
+
+        def _auroc(labels, scores):                  # TP-vs-FP separability (tie-aware)
+            labels = labels.astype(bool)
+            n_pos, n_neg = int(labels.sum()), int((~labels).sum())
+            if n_pos == 0 or n_neg == 0:
+                return float('nan')
+            order = np.argsort(scores, kind='mergesort')
+            _, inv, cnt = np.unique(scores[order], return_inverse=True, return_counts=True)
+            avg_rank = (np.cumsum(cnt) - cnt) + (cnt + 1) / 2.0   # 1-indexed avg rank
+            ranks = np.empty(len(scores), dtype=np.float64)
+            ranks[order] = avg_rank[inv]
+            return (ranks[labels].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+        tp50 = correct_all[:, 0].astype(np.float64)
+        raw_auroc = _auroc(tp50, conf_all)
+
+        oracle_ap = []                               # perfect verify, per IoU threshold
+        for ti in range(correct_all.shape[1]):
+            oc = correct_all[:, ti].astype(np.float32)
+            _, _, ap_o, _, _ = ap_per_class(correct_all, oc, pcls_all, tcls_all,
+                                            plot=False, names=names)
+            oracle_ap.append(float(ap_o[:, ti].mean()))
+        oracle_map50, oracle_map = oracle_ap[0], float(np.mean(oracle_ap))
+
+        print('\n[Step 0 - Oracle re-scoring upper bound]')
+        print('  %-28s %.4f'  % ('baseline  mAP@.5',      map50))
+        print('  %-28s %.4f'  % ('oracle    mAP@.5',      oracle_map50))
+        print('  %-28s %+.4f' % ('headroom  mAP@.5',      oracle_map50 - map50))
+        print('  %-28s %.4f'  % ('baseline  mAP@.5:.95',  map))
+        print('  %-28s %.4f'  % ('oracle    mAP@.5:.95',  oracle_map))
+        print('  %-28s %+.4f' % ('headroom  mAP@.5:.95',  oracle_map - map))
+        print('  %-28s %d / %d  (%.1f%% FP)' % ('detections TP/total',
+              int(tp50.sum()), len(tp50), 100.0 * (1.0 - tp50.mean())))
+        print('  %-28s %.4f   <- verify must beat this' % ('raw-conf AUROC(TP vs FP)', raw_auroc))
+
+    # Error decomposition: per-GT outcome (ok/cls/loc/miss) + high-conf FP types
+    if opt is not None and getattr(opt, 'miss_diag', False) and len(miss_records):
+        mc = np.array([r[0] for r in miss_records])
+        ma = np.array([r[1] for r in miss_records])
+        mb = np.array([r[2] for r in miss_records])
+        def _dist(mask):
+            n = int(mask.sum())
+            if not n:
+                return (0, 0.0, 0.0, 0.0, 0.0)
+            s = mb[mask]
+            return (n, (s == 'ok').mean(), (s == 'cls').mean(), (s == 'loc').mean(), (s == 'miss').mean())
+        print('\n[Error Diagnostic]  GT 분해: ok=정상 / cls=국소화O·분류X / loc=박스나쁨 / miss=완전놓침')
+        print('  %-15s %7s %7s %7s %7s %7s' % ('size', '#GT', 'ok', 'cls', 'loc', 'miss'))
+        for lo, hi, nm in [(0, 16**2, 'tiny(<16)'), (16**2, 32**2, 'small(16-32)'),
+                           (32**2, 96**2, 'medium(32-96)'), (96**2, 1e12, 'large(>96)')]:
+            n, o, c, l, m = _dist((ma >= lo) & (ma < hi))
+            print('  %-15s %7d %7.3f %7.3f %7.3f %7.3f' % (nm, n, o, c, l, m))
+        n, o, c, l, m = _dist(np.ones(len(mb), dtype=bool))
+        print('  %-15s %7d %7.3f %7.3f %7.3f %7.3f' % ('ALL', n, o, c, l, m))
+        print('  --- by class ---')
+        for cc in range(nc):
+            n, o, c, l, m = _dist(mc == cc)
+            cn = names[cc] if (isinstance(names, dict) and cc in names) else str(cc)
+            print('  %-15s %7d %7.3f %7.3f %7.3f %7.3f' % (cn, n, o, c, l, m))
+        if len(fp_records):
+            fr = np.array(fp_records)
+            print('  --- 고신뢰(conf>=0.25) 예측 %d개의 유형 ---' % len(fr))
+            print('  bkg(배경 오검출) %.3f  |  loc(위치 나쁜 검출) %.3f  |  hit(GT 명중) %.3f'
+                  % ((fr == 'bkg').mean(), (fr == 'loc').mean(), (fr == 'hit').mean()))
 
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
@@ -531,6 +789,19 @@ if __name__ == '__main__':
     parser.add_argument('--compute-loss', action='store_true', help='compute loss')
     parser.add_argument('--sparse-head', action='store_true', help='use sparse detection head')
     parser.add_argument('--hm-metric', action='store_true', help='use heatmap-related evaluation metrics')
+    parser.add_argument('--hm-thres', type=float, default=None, help='override HeatMapParser threshold (sweep)')
+    parser.add_argument('--miss-diag', action='store_true', help='miss diagnostic: size/class-stratified recall')
+    parser.add_argument('--calib', action='store_true', help='calibration/reliability eval (ECE, failure detection)')
+    parser.add_argument('--ood-eval', action='store_true', help='OOD detection eval (held-out class GT vs ID)')
+    parser.add_argument('--held-out-classes', type=str, default='', help='OOD: 학습 제외한 class index (예: "7,8")')
+    parser.add_argument('--owod-eval', action='store_true', help='OWOD eval (U-Recall, WI, A-OSE)')
+    parser.add_argument('--owod-known', type=str, default='', help='OWOD known class indices (예: "0,1,2,3,4,5,8,9")')
+    parser.add_argument('--owod-unknown', type=str, default='', help='OWOD unknown class indices (예: "6,7")')
+    parser.add_argument('--owod-method', type=str, default='conf', help='unknown identification: conf/msp/energy/vacuity')
+    parser.add_argument('--owod-tau', type=float, default=0.1, help='unknown identification threshold')
+    parser.add_argument('--oracle', action='store_true', help='Step 0: oracle re-scoring upper bound + raw-conf AUROC')
+    parser.add_argument('--dump-dets', type=str, default=None, help='verify-head 학습용 검출 덤프 저장 경로(.npz)')
+    parser.add_argument('--dump-topk', type=int, default=300, help='이미지당 덤프할 최대 검출 수')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -555,6 +826,7 @@ if __name__ == '__main__':
              use_gt=opt.use_gt,
              sparse_head=opt.sparse_head,
              hm_metric=opt.hm_metric,
+             calib=opt.calib,
              opt=opt
              )
 

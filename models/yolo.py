@@ -31,6 +31,7 @@ from models.spconv import SPYOLOv5Head, SPYOLOv6Head
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging, xyxy2xywh
+from utils import edl_det
 from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
     select_device, copy_attr
 
@@ -60,6 +61,13 @@ class Detect(nn.Module):
         self.sparse = False
         self.register_buffer('sparse_gird', torch.zeros(1))
 
+        # ECPR Stage 1: cross-patch graph refinement (det_graph.ENABLE=False → 미생성 = baseline)
+        from models import det_graph as _dg
+        self.graph = _dg.DetGraphRefine(self.nc) if _dg.ENABLE else None
+        self.graph_out = None      # 학습 시 refine된 per-image 검출 (ComputeLoss 가 읽음)
+        if self.graph is not None:
+            self.inplace = False   # 학습-시 decode를 autograd-safe하게 (in-place 회피)
+
     def set_sparse(self):
         sp_dict = {nn.Conv2d: SPYOLOv5Head, YOLOv6Head: SPYOLOv6Head}
         sp_head = sp_dict[type(self.m[0])]
@@ -68,15 +76,48 @@ class Detect(nn.Module):
     
     @torch.no_grad()
     def get_indices(self, offsets, mask, thresh=0.3):
-        device, dtype = mask.device, mask.dtype
-        if mask.dim() == 4 and mask.shape[1] == 2:
-            # EDL: 2-channel evidence logits → vacuity map
+        # mask: tensor (single) or list [heat,edl] / [heat,edl,vacuity_cal] (dual)
+        if (isinstance(mask, (list, tuple)) and len(mask) == 3
+                and mask[0].shape[1] == 1 and mask[1].shape[1] == 2 and mask[2].shape[1] == 1):
+            # Dual fusion (calib-gating or 3-C noisy-OR per ESOD_ROLE_DUAL env)
+            mask = edl_det.fuse_dual_seg(mask[0].detach(), mask[1].detach(), mask[2].detach())
+        elif isinstance(mask, (list, tuple)) and len(mask) == 2:
+            # Dual + max
+            _heat, _edl = mask[0].detach(), mask[1].detach()
+            prob = _heat.sigmoid()
+            _ev = F.softplus(_edl); _alpha = _ev + 1.0
+            _S = _alpha.sum(dim=1, keepdim=True)
+            vac = 2.0 / _S
+            mask = torch.max(prob, vac)
+        elif mask.dim() == 4 and mask.shape[1] == 2:
+            # Single 2ch EDL: u-aware keep
+            #   B-1 (sum, default): mask = p_obj + gamma * u
+            #   B-2 (dual OR)     : keep = (p_obj > tau_obj) | (u > tau_u); mask = (p_obj + gamma*u) * keep
+            # ESOD_VAC_KEEP_MODE: 'sum' (default) or 'dual'
             evidence = F.softplus(mask.detach())
             alpha = evidence + 1.0
             S = alpha.sum(dim=1, keepdim=True)
-            mask = 2.0 / S  # vacuity [B,1,H,W]
+            p_obj = alpha[:, 1:2] / S                           # belief object (ch1)
+            u = 2.0 / S                                         # vacuity
+            import os as _os_uaw
+            _gamma = float(_os_uaw.environ.get('ESOD_VAC_GAMMA', '0.5'))
+            _keep_mode = _os_uaw.environ.get('ESOD_VAC_KEEP_MODE', 'sum').strip().lower()
+            if _keep_mode == 'dual':
+                # B-2: OR-rule. Two independent score paths, then max → NMS-friendly.
+                # u path is scaled so that u=tau_u → 0.5 (safely above default thresh=0.3).
+                _tau_obj = float(_os_uaw.environ.get('ESOD_VAC_TAU_OBJ', '0.1'))
+                _tau_u   = float(_os_uaw.environ.get('ESOD_VAC_TAU_U',   '0.13'))
+                keep_obj = p_obj > _tau_obj
+                keep_u   = u > _tau_u
+                score_p = torch.where(keep_obj, p_obj, torch.zeros_like(p_obj))
+                _u_scale = 0.5 / max(_tau_u, 1e-6)
+                score_u = torch.where(keep_u, u * _u_scale, torch.zeros_like(u))
+                mask = torch.maximum(score_p, score_u)
+            else:
+                mask = p_obj + _gamma * u                       # u-aware patch score (B-1)
         elif torch.max(mask) > 1. or torch.min(mask) < 0.:
             mask = mask.detach().sigmoid()
+        device, dtype = mask.device, mask.dtype
 
         patch_w, patch_h = offsets[0, 3:5] - offsets[0, 1:3]
         if not hasattr(self, 'sparse_gird') or self.sparse_gird is None or self.sparse_gird[0].shape != (1,patch_h,patch_w):
@@ -134,14 +175,17 @@ class Detect(nn.Module):
     def forward(self, x):
         # x = x.copy()  # for profiling
         masks, offsets, indices_per_layer = None, None, None
+        self.graph_out = None  # deepcopy 안전: 학습 forward 끝~loss 사이에만 채워짐
         if isinstance(x, tuple):
             if len(x) == 2:
                 x, offsets = x  # offsets(bi,x1,y1,x2,y2)
             else:
                 x, offsets, masks = x
-                assert len(masks) == 1 and not isinstance(masks, torch.Tensor)
+                # masks: [t] (Segmenter), [heat,edl] (Dual), [heat,edl,gate] (Dual+MoE)
+                assert len(masks) in (1, 2, 3) and not isinstance(masks, torch.Tensor)
                 if offsets is not None and hasattr(self, 'sparse') and self.sparse:
-                    indices_per_layer = self.get_indices(offsets, masks[0])
+                    mask_arg = masks if len(masks) >= 2 else masks[0]
+                    indices_per_layer = self.get_indices(offsets, mask_arg)
             if offsets is not None:
                 img_bs = torch.max(offsets[:, 0]).int().item() + 1
             else:
@@ -172,12 +216,23 @@ class Detect(nn.Module):
                 x[i] = self.m[i](x[i])  # conv
                 x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
-            if not self.training:  # inference
+            if (not self.training) or (self.graph is not None):  # inference / ECPR decode
                 if self.grid[i].shape[2:4] != (ny, nx) or self.onnx_dynamic:
                     self.grid[i] = self._make_grid(nx, ny).to(device)
 
+                # EOD-style evidential cls activation (env ESOD_EVIDENTIAL_CLS=1)
+                import os as _os_ev
+                _ev_cls_on = _os_ev.environ.get('ESOD_EVIDENTIAL_CLS', '').strip() == '1'
+
                 if sp_x is not None:
                     y = sp_x.features.sigmoid().view(-1, self.na, self.no)
+                    if edl_det.EDL_DET:
+                        y[..., 4] = edl_det.redl_p_obj(
+                            sp_x.features.view(-1, self.na, self.no)[..., 4])
+                    if _ev_cls_on and self.nc > 1:
+                        _cls_logit = sp_x.features.view(-1, self.na, self.no)[..., 5:].clamp(-9.21, 9.21)
+                        _belief, _, _ = edl_det.redl_Kch(_cls_logit)
+                        y[..., 5:] = _belief.to(y.dtype)
                     bi, yi, xi = sp_x.indices.long().T
                     assert offsets is not None
                     grid_off = self.grid[i][0, 0, yi, xi].view(-1, 1, 2) + patch_off_xy[bi, ...].view(-1, 1, 2)
@@ -185,15 +240,22 @@ class Detect(nn.Module):
                     batch_ind = offsets[bi, 0]  # [num_patches, 5] --> [num_objects, 5], compatible for box concat
                 else:
                     y = x[i].sigmoid()
+                    if edl_det.EDL_DET:
+                        y[..., 4] = edl_det.redl_p_obj(x[i][..., 4])
+                    if _ev_cls_on and self.nc > 1:
+                        _cls_logit = x[i][..., 5:].clamp(-9.21, 9.21)
+                        _belief, _, _ = edl_det.redl_Kch(_cls_logit)
+                        # non-inplace 안전 (autograd graph 보존)
+                        y = torch.cat([y[..., :5], _belief.to(y.dtype)], dim=-1)
                     anch_wh = self.anchor_grid[i].view(1, self.na, 1, 1, 2)
                     if offsets is not None:
                         grid_off = self.grid[i] + patch_off_xy
-                        batch_ind = offsets[:, 0]   
+                        batch_ind = offsets[:, 0]
                     else:
                         grid_off = self.grid[i]
                         batch_ind = None
 
-                if self.inplace:
+                if self.inplace and self.graph is None:  # ECPR: graph on → autograd-safe 비in-place 경로
                     y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_off) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * anch_wh  # wh
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
@@ -220,7 +282,101 @@ class Detect(nn.Module):
             
         if offsets is not None:
             x = (x, patch_offsets)
-        return x if self.training else (torch.cat(z, 1), x)
+
+        # Phase 2: Detect parallel evidence head → per-image vacuity map (inference 전용)
+        # layer 0 (P3, stride 8) 의 anchor-min vacuity 를 patch offsets 로 image-space 에 paste.
+        # OOD eval 에서 detection box footprint sample 용.
+        if (not self.training) and offsets is not None and len(self.m) > 0 and \
+                getattr(self.m[0], 'last_ev', None) is not None:
+            stride0 = int(self.stride[0])
+            ev0 = self.m[0].last_ev.detach()              # [Bp, na, 2, ny, nx]
+            e_bg = F.softplus(ev0[:, :, 0, :, :])
+            e_obj = F.softplus(ev0[:, :, 1, :, :])
+            vac_cells = 2.0 / (e_bg + e_obj + 2.0)        # [Bp, na, ny, nx]
+            vac_p = vac_cells.min(dim=1).values           # [Bp, ny, nx] anchor-min
+            # image size 추정: offsets [Bp, 5] (bi, x1, y1, x2, y2) — input pixel space
+            img_w = int(offsets[:, 3].max().item())
+            img_h = int(offsets[:, 4].max().item())
+            Hf = max(1, img_h // stride0); Wf = max(1, img_w // stride0)
+            img_vac = torch.ones((img_bs, Hf, Wf), device=vac_p.device, dtype=vac_p.dtype)
+            for pidx in range(vac_p.shape[0]):
+                bi = int(offsets[pidx, 0])
+                x1 = int(offsets[pidx, 1]) // stride0
+                y1 = int(offsets[pidx, 2]) // stride0
+                _, ny_p, nx_p = vac_p[pidx].shape if vac_p[pidx].dim() == 3 else (None,) + tuple(vac_p[pidx].shape)
+                ny_p, nx_p = vac_p[pidx].shape
+                x2 = min(x1 + nx_p, Wf); y2 = min(y1 + ny_p, Hf)
+                if x2 > x1 and y2 > y1:
+                    img_vac[bi, y1:y2, x1:x2] = torch.minimum(
+                        img_vac[bi, y1:y2, x1:x2], vac_p[pidx, :y2 - y1, :x2 - x1])
+            self.last_det_vac_image = img_vac             # [B_img, Hf, Wf]
+
+        # EOD-style cls vacuity image-paste (env ESOD_EVIDENTIAL_CLS=1) — OWOD unknown ID 용
+        # layer 0 cls logit → softplus → α=e+λ → S → vacuity = K·λ/S, anchor-min, image paste
+        import os as _os_cv
+        if (not self.training) and offsets is not None and len(self.m) > 0 and \
+                _os_cv.environ.get('ESOD_EVIDENTIAL_CLS', '').strip() == '1':
+            try:
+                _x0 = x[0] if isinstance(x, list) else x[0][0]  # x already maybe (x,patch_offsets)
+            except Exception:
+                _x0 = None
+            if _x0 is not None and _x0.dim() == 5 and _x0.shape[-1] >= 5 + self.nc:
+                stride0 = int(self.stride[0])
+                _cls0 = _x0[..., 5:5 + self.nc].clamp(-9.21, 9.21).detach()  # [Bp, na, ny, nx, K]
+                _K = float(self.nc)
+                _S = (F.softplus(_cls0) + edl_det.LAM).sum(-1)           # [Bp, na, ny, nx]
+                _cls_vac_cells = (_K * edl_det.LAM) / _S                   # [Bp, na, ny, nx]
+                _cls_vac_p = _cls_vac_cells.min(dim=1).values              # [Bp, ny, nx] anchor-min
+                img_w = int(offsets[:, 3].max().item())
+                img_h = int(offsets[:, 4].max().item())
+                Hf = max(1, img_h // stride0); Wf = max(1, img_w // stride0)
+                _cls_vac_img = torch.ones((img_bs, Hf, Wf),
+                                          device=_cls_vac_p.device, dtype=_cls_vac_p.dtype)
+                for pidx in range(_cls_vac_p.shape[0]):
+                    bi = int(offsets[pidx, 0])
+                    x1 = int(offsets[pidx, 1]) // stride0
+                    y1 = int(offsets[pidx, 2]) // stride0
+                    ny_p, nx_p = _cls_vac_p[pidx].shape
+                    x2 = min(x1 + nx_p, Wf); y2 = min(y1 + ny_p, Hf)
+                    if x2 > x1 and y2 > y1:
+                        _cls_vac_img[bi, y1:y2, x1:x2] = torch.minimum(
+                            _cls_vac_img[bi, y1:y2, x1:x2],
+                            _cls_vac_p[pidx, :y2 - y1, :x2 - x1])
+                self.last_cls_vac_image = _cls_vac_img                    # [B_img, Hf, Wf]
+
+        # ECPR: cross-patch graph refinement on per-image decoded detections
+        if self.graph is not None and len(z):
+            refined, subset = self._apply_graph(torch.cat(z, 1))
+        else:
+            refined, subset = None, None
+        if self.training:
+            self.graph_out = subset
+            return x
+        return ((refined if refined is not None else torch.cat(z, 1)), x)
+
+    def _apply_graph(self, cat_z, topk=4096):
+        # cat_z [B,N,no] decoded dets → graph-refined. 반환 (full[B,N,no], subset[list])
+        eps = 1e-6
+        gdt = next(self.graph.parameters()).dtype              # graph weight dtype (half/float)
+        full, subset = [], []
+        for i in range(cat_z.shape[0]):
+            p = cat_z[i]
+            idx = (p[:, 4] > 0).nonzero(as_tuple=True)[0]      # 유효 검출 (padding 제외)
+            if idx.numel() < 2:
+                full.append(p); subset.append(p[:0]); continue
+            if idx.numel() > topk:                             # objectness top-K (O(N^2) knn 방지)
+                idx = idx[p[idx, 4].topk(topk).indices]
+            v = p[idx].to(gdt)                                 # graph dtype 로 맞춤 (half/float 혼용 방지)
+            o = v[:, 4].clamp(eps, 1 - eps)
+            c = v[:, 5:].clamp(eps, 1 - eps)
+            r_obj, r_cls, r_box = self.graph(
+                v[:, :4], torch.log(o / (1 - o)), torch.log(c / (1 - c)))
+            ref = torch.cat([r_box, r_obj.sigmoid().unsqueeze(-1),
+                             r_cls.sigmoid()], dim=-1).to(p.dtype)   # 원래 dtype 복귀
+            oi = p.clone()
+            oi[idx] = ref
+            full.append(oi); subset.append(ref)
+        return torch.stack(full, 0), subset
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
@@ -232,10 +388,45 @@ class Segmenter(nn.Module):
     def __init__(self, nc=10, ch=()):
         super(Segmenter, self).__init__()
         self.m = nn.ModuleList(nn.Conv2d(x, nc, 1) for x in ch)  # output conv
-    
+
     def forward(self, x):
         return [self.m[i](x[i]) for i in range(len(x))]
-    
+
+
+class DualSegmenter(nn.Module):
+    """
+    Dual-branch segmentation head with Learnable Spatial Gating:
+      - heat branch:  1ch logit (sigmoid → prob, ESOD baseline)
+      - edl branch:   2ch logit (softplus → evidence → vacuity)
+      - gate branch:  1ch logit (sigmoid → spatial gate α)
+
+    Returns [heat, edl, gate]  (all logits; shapes 1ch / 2ch / 1ch)
+
+    Downstream (HeatMapParser/Loss):
+      prob = sigmoid(heat)
+      evidence = softplus(edl) ; alpha = evidence + 1 ; S = Σα
+      p_e = alpha_obj / S      ; u (vacuity) = 2/S
+      gate = sigmoid(gate)
+      w = gate · (1 - u)
+      F = (1 - w) · prob + w · p_e     (calibrated gating fusion)
+    """
+    def __init__(self, ch=()):
+        super(DualSegmenter, self).__init__()
+        self.heat = nn.ModuleList(nn.Conv2d(c, 1, 1) for c in ch)
+        self.edl  = nn.ModuleList(nn.Conv2d(c, 2, 1) for c in ch)
+        self.gate = nn.ModuleList(nn.Conv2d(c, 1, 1) for c in ch)
+        # gate bias 0 → sigmoid(0)=0.5 (시작은 H/V 균형, collapse 방지 초기화)
+        for g in self.gate:
+            nn.init.zeros_(g.weight)
+            nn.init.zeros_(g.bias)
+
+    def forward(self, x):
+        # x: list of feature tensors (typically 1 element)
+        heat = [self.heat[i](x[i]) for i in range(len(x))]
+        edl  = [self.edl[i](x[i])  for i in range(len(x))]
+        gate = [self.gate[i](x[i]) for i in range(len(x))]
+        return [heat[0], edl[0], gate[0]]
+
 
 class Center(nn.Module):
     def __init__(self, nc=80, ch=()):  # detection layer
@@ -463,8 +654,8 @@ class Model(nn.Module):
             
             x = m(x)  # run
 
-            if isinstance(m, Segmenter):
-                pred_masks = x
+            if isinstance(m, (Segmenter, DualSegmenter)):
+                pred_masks = x  # Segmenter: [tensor], DualSegmenter: [heat, edl]
                 if hm_only:
                     return (None, None), pred_masks
                 if masks is None:
@@ -480,15 +671,31 @@ class Model(nn.Module):
                         return (None, None), pred_masks
                 else:
                     x, thresh = x
-                    _pm = pred_masks[0].detach()
-                    if _pm.shape[1] == 2:
-                        # EDL: vacuity map으로 객체 영역 판단
-                        _ev = F.softplus(_pm)
-                        _alpha = _ev + 1.0
-                        _S = _alpha.sum(dim=1, keepdim=True)
-                        heatmap = 2.0 / _S  # vacuity [B,1,H,W]
+                    # Dual fusion (calib-gating or 3-C noisy-OR per ESOD_ROLE_DUAL env)
+                    if (len(pred_masks) == 3 and pred_masks[0].shape[1] == 1
+                            and pred_masks[1].shape[1] == 2 and pred_masks[2].shape[1] == 1):
+                        from utils import edl_det as _edl_det_mod
+                        heatmap = _edl_det_mod.fuse_dual_seg(
+                            pred_masks[0].detach(), pred_masks[1].detach(), pred_masks[2].detach())
+                    elif (len(pred_masks) == 2 and pred_masks[0].shape[1] == 1
+                          and pred_masks[1].shape[1] == 2):
+                        # Dual + max (legacy)
+                        _heat = pred_masks[0].detach()
+                        _edl  = pred_masks[1].detach()
+                        prob  = _heat.sigmoid()
+                        _ev   = F.softplus(_edl); _alpha = _ev + 1.0
+                        _S    = _alpha.sum(dim=1, keepdim=True)
+                        vac   = 2.0 / _S
+                        heatmap = torch.max(prob, vac)
                     else:
-                        heatmap = _pm.sigmoid()
+                        _pm = pred_masks[0].detach()
+                        if _pm.shape[1] == 2:
+                            _ev = F.softplus(_pm)
+                            _alpha = _ev + 1.0
+                            _S = _alpha.sum(dim=1, keepdim=True)
+                            heatmap = 2.0 / _S
+                        else:
+                            heatmap = _pm.sigmoid()
                     heatmap = heatmap > thresh
             y.append(x if m.i in self.save else None)  # save output
 
@@ -623,7 +830,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = sum([ch[x] for x in f])
         elif m in [Add, nn.Identity]:
             pass
-        elif m in [Detect, Segmenter]:  # Detect2 deprecated
+        elif m in [Detect, Segmenter, DualSegmenter]:  # Detect2 deprecated
             args.append([ch[x] for x in f])
             if len(args) > 1 and isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

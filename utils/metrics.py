@@ -176,23 +176,45 @@ def heatmap_quality_update(p_seg, masks, targets, stats, threshold=0.5):
     """
     Accumulate heatmap quality stats for one batch.
 
-    p_seg  : [B, C, H, W]  C=1 (sigmoid logit) or C=2 (EDL evidence logits)
-    masks  : [B, 1, H, W]  binary GT mask (0/1 float)
-    targets: [N, 6]        [batch_idx, cls, xc, yc, w, h] normalized
-    stats  : dict with int keys 'tp','fp','tn','fn','obj_hit','obj_total'
+    p_seg : tensor [B,C,H,W]  C=1 (sigmoid) or C=2 (EDL evidence)
+            or list [heat[B,1,H,W], edl[B,2,H,W]]  (Dual branch)
+    masks : [B, 1, H, W]  binary GT mask (0/1 float)
     """
-    device = p_seg.device
-    B, C, H, W = p_seg.shape
-
-    # → detection map [B,1,H,W]
-    if C == 2:
-        # EDL: vacuity 기반 탐지 (불확실한 곳 = 객체 후보)
-        evidence = F.softplus(p_seg)
+    # === Dual calibrated fusion: F=(1-w)·prob_h+w·p_e, w=σ(gate)·(1-u) ===
+    if (isinstance(p_seg, (list, tuple)) and len(p_seg) == 3
+            and p_seg[0].shape[1] == 1 and p_seg[1].shape[1] == 2 and p_seg[2].shape[1] == 1):
+        p_heat, p_edl, p_gate = p_seg[0], p_seg[1], p_seg[2]
+        device = p_heat.device
+        B, _, H, W = p_heat.shape
+        prob = p_heat.sigmoid()
+        evidence = F.softplus(p_edl); alpha = evidence + 1.0
+        S = alpha.sum(dim=1, keepdim=True)
+        p_e = alpha[:, 1:2] / S                          # EDL 객체확률 (ch1=obj)
+        u   = 2.0 / S                                    # vacuity = 인식 불확실도
+        gate = p_gate.sigmoid()
+        w   = gate * (1.0 - u)                           # 신뢰가중: EDL 확신할 때만 위임
+        detection_map = (1.0 - w) * prob + w * p_e       # [0,1] calibrated
+    # === Dual + max: [heat(1ch), edl(2ch)] ===
+    elif isinstance(p_seg, (list, tuple)) and len(p_seg) == 2:
+        p_heat, p_edl = p_seg[0], p_seg[1]
+        device = p_heat.device
+        B, _, H, W = p_heat.shape
+        prob = p_heat.sigmoid()
+        evidence = F.softplus(p_edl)
         alpha = evidence + 1.0
         S = alpha.sum(dim=1, keepdim=True)
-        detection_map = 2.0 / S           # vacuity [B,1,H,W]
+        vac = 2.0 / S
+        detection_map = torch.max(prob, vac)
     else:
-        detection_map = p_seg.sigmoid()
+        device = p_seg.device
+        B, C, H, W = p_seg.shape
+        if C == 2:
+            evidence = F.softplus(p_seg)
+            alpha = evidence + 1.0
+            S = alpha.sum(dim=1, keepdim=True)
+            detection_map = 2.0 / S
+        else:
+            detection_map = p_seg.sigmoid()
 
     pred_bin = detection_map >= threshold  # [B,1,H,W]
     gt_bin   = masks >= 0.5               # [B,1,H,W]
